@@ -1,0 +1,10 @@
+/public/dist/
+/web/node_modules/
+/web/.bun-tmp/
+/.env
+/tracker.exe
+/tracker
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.gpx

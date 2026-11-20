@@ -1,0 +1,91 @@
+name: Build and test
+
+on:
+  pull_request:
+  push:
+    branches: ['**']
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.4'
+      - name: Check and build frontend
+        working-directory: web
+        run: |
+          bun install --frozen-lockfile
+          bun run check
+          bun run build
+      - name: Test backend
+        run: |
+          go vet ./...
+          go test -race ./...
+      - name: Build and smoke-test container
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build -t gps-tracker:ci .
+          data=$(mktemp -d)
+          chmod 777 "$data"
+          trap 'docker rm -f tracker-ci >/dev/null 2>&1 || true; sudo rm -f "$data"/tracker.sqlite*; rmdir "$data"' EXIT
+          start() {
+            docker run --detach --name tracker-ci -p 127.0.0.1::8080 -v "$data:/data" gps-tracker:ci
+            endpoint="http://$(docker port tracker-ci 8080/tcp)"
+            for attempt in $(seq 1 30); do
+              if curl --silent --fail "$endpoint/healthz" >/dev/null; then return; fi
+              sleep 1
+            done
+            docker logs tracker-ci
+            return 1
+          }
+          start
+          curl --fail --silent "$endpoint/manifest.webmanifest" | python3 -c 'import json, sys; assert json.load(sys.stdin)["display"] == "standalone"'
+          key=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
+          sudo python3 - "$data/tracker.sqlite" "$key" <<'PY'
+          import hashlib, sqlite3, sys
+          with sqlite3.connect(sys.argv[1]) as db:
+              db.execute("INSERT INTO users (id, issuer, subject, name) VALUES (1, 'ci', 'ci', 'CI')")
+              db.execute("INSERT INTO device_keys (user_id, name, hash) VALUES (1, 'CI phone', ?)", (hashlib.sha256(sys.argv[2].encode()).digest(),))
+          PY
+          curl --fail --silent "$endpoint/api/upload" -H "Authorization: Bearer $key" -H 'Content-Type: application/json' \
+            --data '{"lat":50,"lon":10,"time":"2025-01-01T09:00:00Z"}'
+          docker rm -f tracker-ci
+          start
+          sudo python3 - "$data/tracker.sqlite" <<'PY'
+          import sqlite3, sys
+          with sqlite3.connect(sys.argv[1]) as db:
+              assert db.execute("SELECT lat, lon FROM points").fetchall() == [(50.0, 10.0)]
+          PY
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Publish release image
+        shell: bash
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-._][a-zA-Z0-9._-]+)?$ ]]
+          printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker buildx build --platform linux/amd64,linux/arm64 --push \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --tag "ghcr.io/${GITHUB_REPOSITORY,,}:$GITHUB_REF_NAME" .
