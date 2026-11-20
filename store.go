@@ -43,6 +43,14 @@ func openDB(path string) (*sql.DB, error) {
 			expires INTEGER NOT NULL
 		);
 		CREATE INDEX IF NOT EXISTS sessions_expiry ON sessions(expires);
+		CREATE TABLE IF NOT EXISTS refresh_tokens (
+			hash BLOB PRIMARY KEY, family_id BLOB NOT NULL,
+			user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			session_hash BLOB, expires INTEGER NOT NULL, revoked INTEGER
+		);
+		CREATE INDEX IF NOT EXISTS refresh_tokens_expiry ON refresh_tokens(expires);
+		CREATE INDEX IF NOT EXISTS refresh_tokens_family ON refresh_tokens(family_id);
+		CREATE INDEX IF NOT EXISTS refresh_tokens_user ON refresh_tokens(user_id);
 		CREATE TABLE IF NOT EXISTS device_keys (
 			id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 			name TEXT NOT NULL, hash BLOB NOT NULL UNIQUE, last_used INTEGER, revoked INTEGER
@@ -51,23 +59,63 @@ func openDB(path string) (*sql.DB, error) {
 		CREATE TABLE IF NOT EXISTS points (
 			id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 			stream TEXT NOT NULL, recorded_at INTEGER NOT NULL, lat REAL NOT NULL, lon REAL NOT NULL,
-			edited_lat REAL, edited_lon REAL, revision INTEGER NOT NULL DEFAULT 0,
+			edited_lat REAL, edited_lon REAL, edited_time INTEGER, revision INTEGER NOT NULL DEFAULT 0,
 			estimated INTEGER NOT NULL DEFAULT 0, break_before INTEGER NOT NULL DEFAULT 0,
 			CHECK (lat BETWEEN -90 AND 90 AND lon BETWEEN -180 AND 180)
 		);
 		CREATE INDEX IF NOT EXISTS points_range ON points(user_id, recorded_at, id);
 		CREATE INDEX IF NOT EXISTS points_stream ON points(user_id, stream, recorded_at, id);
 		CREATE UNIQUE INDEX IF NOT EXISTS original_fix ON points(user_id, recorded_at, lat, lon) WHERE estimated = 0;
+		CREATE TABLE IF NOT EXISTS upload_history (
+			id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			device_id INTEGER REFERENCES device_keys(id) ON DELETE SET NULL,
+			recorded_at INTEGER NOT NULL, received_at INTEGER NOT NULL,
+			lat REAL NOT NULL, lon REAL NOT NULL, duplicate INTEGER NOT NULL DEFAULT 0
+		);
+		CREATE INDEX IF NOT EXISTS upload_history_user ON upload_history(user_id, id DESC);
 	`)
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("initialize SQLite: %w", err)
 	}
+	if err := ensureColumn(db, "points", "edited_time", "INTEGER"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate SQLite: %w", err)
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS points_edited_time ON points(user_id, edited_time, id) WHERE edited_time IS NOT NULL`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("index edited_time: %w", err)
+	}
 	var version int
-	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err == nil && version == 0 {
-		_, _ = db.Exec("PRAGMA user_version = 1")
+	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err == nil && version < 2 {
+		_, _ = db.Exec("PRAGMA user_version = 2")
 	}
 	return db, nil
+}
+
+func ensureColumn(db *sql.DB, table, column, definition string) error {
+	rows, err := db.Query("PRAGMA table_info(" + table + ")")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notNull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dflt, &pk); err != nil {
+			return err
+		}
+		if name == column {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = db.Exec("ALTER TABLE " + table + " ADD COLUMN " + column + " " + definition)
+	return err
 }
 
 func openReadDB(path string) (*sql.DB, error) {

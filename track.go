@@ -107,10 +107,20 @@ func (a *app) upload(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if _, err = tx.ExecContext(ctx, insertFix, owner, "device-"+strconv.FormatInt(device, 10), ts, *input.Lat, *input.Lon, false, false); err != nil {
+	res, err := tx.ExecContext(ctx, insertFix, owner, "device-"+strconv.FormatInt(device, 10), ts, *input.Lat, *input.Lon, false, false)
+	if err != nil {
 		serverError(w, err)
 		return
 	}
+	affected, _ := res.RowsAffected()
+	duplicate := affected == 0
+	if _, err = tx.ExecContext(ctx, `INSERT INTO upload_history (user_id, device_id, recorded_at, received_at, lat, lon, duplicate)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`, owner, device, ts, time.Now().UnixMilli(), *input.Lat, *input.Lon, duplicate); err != nil {
+		serverError(w, err)
+		return
+	}
+	_, _ = tx.ExecContext(ctx, `DELETE FROM upload_history WHERE user_id = ? AND id NOT IN (
+		SELECT id FROM upload_history WHERE user_id = ? ORDER BY id DESC LIMIT 50)`, owner, owner)
 	if err = tx.Commit(); err != nil {
 		serverError(w, err)
 		return
@@ -118,14 +128,97 @@ func (a *app) upload(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+type recentUpload struct {
+	ID         int64   `json:"id"`
+	DeviceName string  `json:"deviceName"`
+	Lat        float64 `json:"lat"`
+	Lon        float64 `json:"lon"`
+	RecordedAt int64   `json:"recordedAt"`
+	ReceivedAt int64   `json:"receivedAt"`
+	Duplicate  bool    `json:"duplicate"`
+}
+
+func (a *app) recentUploads(w http.ResponseWriter, r *http.Request, user account) {
+	ctx := r.Context()
+	rows, err := a.reader().QueryContext(ctx, `
+		SELECT h.id, COALESCE(d.name, 'Device'), h.lat, h.lon, h.recorded_at, h.received_at, h.duplicate
+		FROM upload_history h
+		LEFT JOIN device_keys d ON d.id = h.device_id
+		WHERE h.user_id = ?
+		ORDER BY h.id DESC
+		LIMIT 10`, user.ID)
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	items := make([]recentUpload, 0, 10)
+	for rows.Next() {
+		var item recentUpload
+		if err := rows.Scan(&item.ID, &item.DeviceName, &item.Lat, &item.Lon, &item.RecordedAt, &item.ReceivedAt, &item.Duplicate); err != nil {
+			rows.Close()
+			serverError(w, err)
+			return
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		serverError(w, err)
+		return
+	}
+	rows.Close()
+
+	if len(items) == 0 {
+		fallback, err := a.reader().QueryContext(ctx, `
+			SELECT p.id, COALESCE(d.name, 'Device'), COALESCE(p.edited_lat, p.lat), COALESCE(p.edited_lon, p.lon),
+				COALESCE(p.edited_time, p.recorded_at)
+			FROM points p
+			LEFT JOIN device_keys d ON p.stream = 'device-' || d.id AND d.user_id = p.user_id
+			WHERE p.user_id = ? AND p.stream LIKE 'device-%'
+			ORDER BY p.id DESC
+			LIMIT 10`, user.ID)
+		if err != nil {
+			serverError(w, err)
+			return
+		}
+		defer fallback.Close()
+		for fallback.Next() {
+			var item recentUpload
+			if err := fallback.Scan(&item.ID, &item.DeviceName, &item.Lat, &item.Lon, &item.RecordedAt); err != nil {
+				serverError(w, err)
+				return
+			}
+			item.ReceivedAt = item.RecordedAt
+			items = append(items, item)
+		}
+		if err := fallback.Err(); err != nil {
+			serverError(w, err)
+			return
+		}
+	}
+	jsonResponse(w, http.StatusOK, items)
+}
+
+const (
+	minValidTime = -62135596800000
+	maxValidTime = 253402300799999
+)
+
+func validTime(ts int64) bool {
+	return ts >= minValidTime && ts <= maxValidTime
+}
+
 func timeRange(r *http.Request) (int64, int64, bool) {
 	query := r.URL.Query()
 	start, errStart := strconv.ParseInt(query.Get("from"), 10, 64)
 	end, errEnd := strconv.ParseInt(query.Get("to"), 10, 64)
-	return start, end, errStart == nil && errEnd == nil && start >= -62135596800000 && end <= 253402300799999 && start < end
+	return start, end, errStart == nil && errEnd == nil && validTime(start) && validTime(end) && start < end
 }
 
-const pointFields = "id, recorded_at, COALESCE(edited_lat, lat), COALESCE(edited_lon, lon), stream, revision, edited_lat IS NOT NULL, estimated, break_before"
+const (
+	pointFields = "id, COALESCE(edited_time, recorded_at), COALESCE(edited_lat, lat), COALESCE(edited_lon, lon), stream, revision, (edited_lat IS NOT NULL OR edited_time IS NOT NULL), estimated, break_before"
+	rangeFilter = "user_id = ? AND ((edited_time IS NULL AND recorded_at >= ? AND recorded_at < ?) OR (edited_time IS NOT NULL AND edited_time >= ? AND edited_time < ?))"
+)
 
 type scanner interface {
 	Scan(...any) error
@@ -156,7 +249,7 @@ func (a *app) getRoute(w http.ResponseWriter, r *http.Request, user account) {
 	}
 	defer tx.Rollback()
 	var count int64
-	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM points WHERE user_id = ? AND recorded_at >= ? AND recorded_at < ?", user.ID, start, end).Scan(&count); err != nil {
+	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM points WHERE "+rangeFilter, user.ID, start, end, start, end).Scan(&count); err != nil {
 		serverError(w, err)
 		return
 	}
@@ -166,7 +259,7 @@ func (a *app) getRoute(w http.ResponseWriter, r *http.Request, user account) {
 		return
 	}
 	stride := max(int64(1), (count+limit-1)/limit)
-	rows, err := tx.QueryContext(ctx, "SELECT "+pointFields+" FROM points WHERE user_id = ? AND recorded_at >= ? AND recorded_at < ? ORDER BY stream, recorded_at, id", user.ID, start, end)
+	rows, err := tx.QueryContext(ctx, "SELECT "+pointFields+" FROM points WHERE "+rangeFilter+" ORDER BY stream, COALESCE(edited_time, recorded_at), id", user.ID, start, end, start, end)
 	if err != nil {
 		serverError(w, err)
 		return
@@ -257,21 +350,47 @@ func (a *app) movePoint(w http.ResponseWriter, r *http.Request, user account) {
 	}
 	var input struct {
 		coordinates
-		Revision int
-		Revert   bool
+		Time     *int64 `json:"time"`
+		Revision int    `json:"revision"`
+		Revert   bool   `json:"revert"`
 	}
 	if !readJSON(w, r, &input) {
 		return
 	}
-	if !input.Revert && !input.valid() {
+	if input.Revert {
+		result, err := a.db.ExecContext(r.Context(), `UPDATE points SET edited_lat = NULL, edited_lon = NULL, edited_time = NULL, revision = revision + 1
+			WHERE id = ? AND user_id = ? AND revision = ?`, id, user.ID, input.Revision)
+		if err != nil {
+			serverError(w, err)
+			return
+		}
+		if count, _ := result.RowsAffected(); count == 0 {
+			problem(w, http.StatusConflict, "Point unavailable or changed. Refresh the route and try again.")
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	hasCoords := input.Lat != nil || input.Lon != nil
+	hasTime := input.Time != nil
+	if !hasCoords && !hasTime {
+		problem(w, http.StatusBadRequest, "Enter valid coordinates or a recording time")
+		return
+	}
+	if hasCoords && !input.valid() {
 		problem(w, http.StatusBadRequest, "Enter valid coordinates")
 		return
 	}
-	if input.Revert {
-		input.Lat, input.Lon = nil, nil
+	if hasTime && !validTime(*input.Time) {
+		problem(w, http.StatusBadRequest, "Enter a valid recording time")
+		return
 	}
-	result, err := a.db.ExecContext(r.Context(), `UPDATE points SET edited_lat = ?, edited_lon = ?, revision = revision + 1
-		WHERE id = ? AND user_id = ? AND revision = ?`, input.Lat, input.Lon, id, user.ID, input.Revision)
+	result, err := a.db.ExecContext(r.Context(), `UPDATE points
+		SET edited_lat = COALESCE(?, edited_lat),
+			edited_lon = COALESCE(?, edited_lon),
+			edited_time = COALESCE(?, edited_time),
+			revision = revision + 1
+		WHERE id = ? AND user_id = ? AND revision = ?`, input.Lat, input.Lon, input.Time, id, user.ID, input.Revision)
 	if err != nil {
 		serverError(w, err)
 		return
@@ -348,7 +467,7 @@ func (a *app) addPoints(w http.ResponseWriter, r *http.Request, user account) {
 	}
 	var overlap bool
 	err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM points WHERE user_id = ? AND stream = ?
-		AND (recorded_at, id) > (?, ?) AND (recorded_at, id) < (?, ?))`,
+		AND (COALESCE(edited_time, recorded_at), id) > (?, ?) AND (COALESCE(edited_time, recorded_at), id) < (?, ?))`,
 		user.ID, left.Stream, left.Time, left.ID, right.Time, right.ID).Scan(&overlap)
 	if err != nil {
 		serverError(w, err)

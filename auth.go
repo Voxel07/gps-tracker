@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/subtle"
 	"database/sql"
 	"errors"
@@ -14,9 +15,48 @@ import (
 	"golang.org/x/oauth2"
 )
 
+const (
+	sessionTokenAge = 15 * time.Minute
+	refreshTokenAge = 30 * 24 * time.Hour
+)
+
 type account struct {
 	ID   int64  `json:"-"`
 	Name string `json:"name"`
+}
+
+func (a *app) issueTokens(ctx context.Context, w http.ResponseWriter, userID int64, familyID []byte) (int64, error) {
+	if len(familyID) == 0 {
+		familyID = randBytes(32)
+	}
+	session := newToken()
+	refresh := newToken()
+	now := time.Now()
+	sessionExpires := now.Add(sessionTokenAge).Unix()
+	refreshExpires := now.Add(refreshTokenAge).Unix()
+	sessionHash := tokenHash(session)
+	refreshHash := tokenHash(refresh)
+
+	tx, err := a.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, "INSERT INTO sessions (hash, user_id, expires) VALUES (?, ?, ?)", sessionHash, userID, sessionExpires); err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, "INSERT INTO refresh_tokens (hash, family_id, user_id, session_hash, expires) VALUES (?, ?, ?, ?, ?)",
+		refreshHash, familyID, userID, sessionHash, refreshExpires); err != nil {
+		return 0, err
+	}
+	_, _ = tx.ExecContext(ctx, "DELETE FROM sessions WHERE expires <= ?", now.Unix())
+	_, _ = tx.ExecContext(ctx, "DELETE FROM refresh_tokens WHERE expires <= ?", now.Unix())
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	a.cookie(w, "gps_session", session, int(sessionTokenAge.Seconds()))
+	a.cookie(w, "gps_refresh", refresh, int(refreshTokenAge.Seconds()))
+	return sessionExpires * 1000, nil
 }
 
 func (a *app) cookie(w http.ResponseWriter, name, value string, age int) {
@@ -94,40 +134,165 @@ func (a *app) callback(w http.ResponseWriter, r *http.Request) {
 		serverError(w, err)
 		return
 	}
-	session := newToken()
-	const sessionAge = 7 * 24 * time.Hour
-	_, err = a.db.ExecContext(ctx, "INSERT INTO sessions VALUES (?, ?, ?)", tokenHash(session), userID, time.Now().Add(sessionAge).Unix())
-	if err != nil {
+	if _, err := a.issueTokens(ctx, w, userID, nil); err != nil {
 		serverError(w, err)
 		return
 	}
-	_, _ = a.db.ExecContext(ctx, "DELETE FROM sessions WHERE expires <= ?", time.Now().Unix())
-	a.cookie(w, "gps_session", session, int(sessionAge.Seconds()))
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
-func (a *app) lookupSession(r *http.Request) (account, error) {
+func (a *app) lookupSession(r *http.Request) (account, int64, error) {
 	var user account
+	var expires int64
 	token := a.cookieValue(r, "gps_session")
 	if token == "" {
-		return user, sql.ErrNoRows
+		return user, 0, sql.ErrNoRows
 	}
-	err := a.reader().QueryRowContext(r.Context(), `SELECT users.id, users.name FROM sessions JOIN users ON users.id = sessions.user_id
-		WHERE sessions.hash = ? AND sessions.expires > ?`, tokenHash(token), time.Now().Unix()).Scan(&user.ID, &user.Name)
-	return user, err
+	err := a.reader().QueryRowContext(r.Context(), `SELECT users.id, users.name, sessions.expires FROM sessions JOIN users ON users.id = sessions.user_id
+		WHERE sessions.hash = ? AND sessions.expires > ?`, tokenHash(token), time.Now().Unix()).Scan(&user.ID, &user.Name, &expires)
+	return user, expires * 1000, err
+}
+
+func (a *app) hasRefreshToken(r *http.Request) bool {
+	token := a.cookieValue(r, "gps_refresh")
+	if token == "" {
+		return false
+	}
+	var exists bool
+	err := a.reader().QueryRowContext(r.Context(),
+		"SELECT EXISTS(SELECT 1 FROM refresh_tokens WHERE hash = ? AND revoked IS NULL AND expires > ?)",
+		tokenHash(token), time.Now().Unix()).Scan(&exists)
+	return err == nil && exists
 }
 
 func (a *app) sessionStatus(w http.ResponseWriter, r *http.Request) {
-	user, err := a.lookupSession(r)
+	user, expiresAt, err := a.lookupSession(r)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		serverError(w, err)
 		return
 	}
 	var signedIn *account
+	var exp *int64
 	if err == nil {
 		signedIn = &user
+		exp = &expiresAt
 	}
-	jsonResponse(w, http.StatusOK, map[string]any{"user": signedIn, "signInAvailable": a.oidc != nil})
+	refreshable := signedIn == nil && a.hasRefreshToken(r)
+	jsonResponse(w, http.StatusOK, map[string]any{
+		"user":            signedIn,
+		"expiresAt":       exp,
+		"refreshable":     refreshable,
+		"signInAvailable": a.oidc != nil,
+	})
+}
+
+func (a *app) refresh(w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get("Origin") != a.origin {
+		problem(w, http.StatusForbidden, "Request must come from the tracker")
+		return
+	}
+	rawRefresh := a.cookieValue(r, "gps_refresh")
+	if rawRefresh == "" {
+		a.cookie(w, "gps_session", "", -1)
+		a.cookie(w, "gps_refresh", "", -1)
+		problem(w, http.StatusUnauthorized, "Sign in to continue")
+		return
+	}
+	ctx := r.Context()
+	now := time.Now()
+	nowUnix := now.Unix()
+	refreshHash := tokenHash(rawRefresh)
+
+	tx, err := a.db.BeginTx(ctx, nil)
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	defer tx.Rollback()
+
+	var familyID, oldSessionHash []byte
+	var userID, expires int64
+	var revoked sql.NullInt64
+	err = tx.QueryRowContext(ctx,
+		"SELECT family_id, user_id, session_hash, expires, revoked FROM refresh_tokens WHERE hash = ?",
+		refreshHash).Scan(&familyID, &userID, &oldSessionHash, &expires, &revoked)
+	if errors.Is(err, sql.ErrNoRows) {
+		a.cookie(w, "gps_session", "", -1)
+		a.cookie(w, "gps_refresh", "", -1)
+		problem(w, http.StatusUnauthorized, "Sign in to continue")
+		return
+	}
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+
+	if revoked.Valid {
+		// Refresh token reuse detected: revoke the entire token family.
+		_, _ = tx.ExecContext(ctx, "DELETE FROM sessions WHERE hash IN (SELECT session_hash FROM refresh_tokens WHERE family_id = ? AND session_hash IS NOT NULL)", familyID)
+		_, _ = tx.ExecContext(ctx, "DELETE FROM refresh_tokens WHERE family_id = ?", familyID)
+		_ = tx.Commit()
+		a.cookie(w, "gps_session", "", -1)
+		a.cookie(w, "gps_refresh", "", -1)
+		problem(w, http.StatusUnauthorized, "Session revoked. Sign in again.")
+		return
+	}
+
+	if expires <= nowUnix {
+		_, _ = tx.ExecContext(ctx, "DELETE FROM refresh_tokens WHERE hash = ?", refreshHash)
+		_ = tx.Commit()
+		a.cookie(w, "gps_session", "", -1)
+		a.cookie(w, "gps_refresh", "", -1)
+		problem(w, http.StatusUnauthorized, "Session expired. Sign in again.")
+		return
+	}
+
+	var user account
+	if err := tx.QueryRowContext(ctx, "SELECT id, name FROM users WHERE id = ?", userID).Scan(&user.ID, &user.Name); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			a.cookie(w, "gps_session", "", -1)
+			a.cookie(w, "gps_refresh", "", -1)
+			problem(w, http.StatusUnauthorized, "Sign in to continue")
+			return
+		}
+		serverError(w, err)
+		return
+	}
+
+	if _, err := tx.ExecContext(ctx, "UPDATE refresh_tokens SET revoked = ? WHERE hash = ?", nowUnix, refreshHash); err != nil {
+		serverError(w, err)
+		return
+	}
+	if len(oldSessionHash) > 0 {
+		_, _ = tx.ExecContext(ctx, "DELETE FROM sessions WHERE hash = ?", oldSessionHash)
+	}
+
+	newSession := newToken()
+	newRefresh := newToken()
+	newSessionHash := tokenHash(newSession)
+	newRefreshHash := tokenHash(newRefresh)
+	sessionExpires := now.Add(sessionTokenAge).Unix()
+	refreshExpires := now.Add(refreshTokenAge).Unix()
+
+	if _, err := tx.ExecContext(ctx, "INSERT INTO sessions (hash, user_id, expires) VALUES (?, ?, ?)", newSessionHash, userID, sessionExpires); err != nil {
+		serverError(w, err)
+		return
+	}
+	if _, err := tx.ExecContext(ctx, "INSERT INTO refresh_tokens (hash, family_id, user_id, session_hash, expires) VALUES (?, ?, ?, ?, ?)",
+		newRefreshHash, familyID, userID, newSessionHash, refreshExpires); err != nil {
+		serverError(w, err)
+		return
+	}
+	_, _ = tx.ExecContext(ctx, "DELETE FROM sessions WHERE expires <= ?", nowUnix)
+	_, _ = tx.ExecContext(ctx, "DELETE FROM refresh_tokens WHERE expires <= ?", nowUnix)
+
+	if err := tx.Commit(); err != nil {
+		serverError(w, err)
+		return
+	}
+	a.cookie(w, "gps_session", newSession, int(sessionTokenAge.Seconds()))
+	a.cookie(w, "gps_refresh", newRefresh, int(refreshTokenAge.Seconds()))
+	jsonResponse(w, http.StatusOK, map[string]any{"user": user, "expiresAt": sessionExpires * 1000})
 }
 
 func (a *app) signedIn(handler func(http.ResponseWriter, *http.Request, account)) http.HandlerFunc {
@@ -136,7 +301,7 @@ func (a *app) signedIn(handler func(http.ResponseWriter, *http.Request, account)
 			problem(w, http.StatusForbidden, "Request must come from the tracker")
 			return
 		}
-		user, err := a.lookupSession(r)
+		user, _, err := a.lookupSession(r)
 		if errors.Is(err, sql.ErrNoRows) {
 			problem(w, http.StatusUnauthorized, "Sign in to continue")
 			return
@@ -149,13 +314,35 @@ func (a *app) signedIn(handler func(http.ResponseWriter, *http.Request, account)
 	}
 }
 
-func (a *app) logout(w http.ResponseWriter, r *http.Request, _ account) {
-	_, err := a.db.ExecContext(r.Context(), "DELETE FROM sessions WHERE hash = ?", tokenHash(a.cookieValue(r, "gps_session")))
-	if err != nil {
-		serverError(w, err)
+func (a *app) logout(w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get("Origin") != a.origin {
+		problem(w, http.StatusForbidden, "Request must come from the tracker")
 		return
 	}
+	ctx := r.Context()
+	if session := a.cookieValue(r, "gps_session"); session != "" {
+		if _, err := a.db.ExecContext(ctx, "DELETE FROM sessions WHERE hash = ?", tokenHash(session)); err != nil {
+			serverError(w, err)
+			return
+		}
+	}
+	if refresh := a.cookieValue(r, "gps_refresh"); refresh != "" {
+		tx, err := a.db.BeginTx(ctx, nil)
+		if err != nil {
+			serverError(w, err)
+			return
+		}
+		defer tx.Rollback()
+		var familyID []byte
+		err = tx.QueryRowContext(ctx, "SELECT family_id FROM refresh_tokens WHERE hash = ?", tokenHash(refresh)).Scan(&familyID)
+		if err == nil && len(familyID) > 0 {
+			_, _ = tx.ExecContext(ctx, "DELETE FROM sessions WHERE hash IN (SELECT session_hash FROM refresh_tokens WHERE family_id = ? AND session_hash IS NOT NULL)", familyID)
+			_, _ = tx.ExecContext(ctx, "DELETE FROM refresh_tokens WHERE family_id = ?", familyID)
+		}
+		_ = tx.Commit()
+	}
 	a.cookie(w, "gps_session", "", -1)
+	a.cookie(w, "gps_refresh", "", -1)
 	w.WriteHeader(http.StatusNoContent)
 }
 

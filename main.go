@@ -196,7 +196,7 @@ func validServerURL(value string, originOnly bool) bool {
 	return u.Scheme == "http" && (!originOnly || u.Hostname() == "localhost" || u.Hostname() == "127.0.0.1" || u.Hostname() == "::1")
 }
 
-const contentSecurityPolicy = "default-src 'self'; img-src 'self' https://tile.openstreetmap.org data:; style-src 'self' 'unsafe-inline'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+const contentSecurityPolicy = "default-src 'self'; img-src 'self' https://tile.openstreetmap.org https://*.basemaps.cartocdn.com https://*.tile.opentopomap.org https://server.arcgisonline.com data:; style-src 'self' 'unsafe-inline'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
 
 func (a *app) routes() http.Handler {
 	mux := http.NewServeMux()
@@ -209,17 +209,20 @@ func (a *app) routes() http.Handler {
 	})
 	mux.HandleFunc("GET /auth/login", a.login)
 	mux.HandleFunc("GET /auth/callback", a.callback)
-	mux.HandleFunc("POST /auth/logout", a.signedIn(a.logout))
+	mux.HandleFunc("POST /auth/refresh", a.refresh)
+	mux.HandleFunc("POST /auth/logout", a.logout)
 	mux.HandleFunc("POST /api/upload", a.upload)
 	mux.HandleFunc("GET /api/session", a.sessionStatus)
 	mux.HandleFunc("GET /api/keys", a.signedIn(a.listKeys))
 	mux.HandleFunc("POST /api/keys", a.signedIn(a.createKey))
 	mux.HandleFunc("DELETE /api/keys/{id}", a.signedIn(a.revokeKey))
 	mux.HandleFunc("GET /api/route", a.signedIn(a.getRoute))
+	mux.HandleFunc("GET /api/points/recent", a.signedIn(a.recentUploads))
 	mux.HandleFunc("PATCH /api/points/{id}", a.signedIn(a.movePoint))
 	mux.HandleFunc("DELETE /api/points/{id}", a.signedIn(a.deletePoint))
 	mux.HandleFunc("POST /api/points", a.signedIn(a.addPoints))
 	mux.HandleFunc("POST /api/import", a.signedIn(a.importTrack))
+	mux.HandleFunc("GET /api/export", a.signedIn(a.exportGPX))
 	mux.HandleFunc("GET /api/immich", a.signedIn(a.immichStatus))
 	mux.HandleFunc("PUT /api/immich", a.signedIn(a.saveImmich))
 	mux.HandleFunc("DELETE /api/immich", a.signedIn(a.deleteImmich))
@@ -250,6 +253,7 @@ func isCompressibleType(contentType string) bool {
 	media := strings.ToLower(strings.TrimSpace(strings.SplitN(contentType, ";", 2)[0]))
 	return strings.HasPrefix(media, "text/") ||
 		media == "application/json" ||
+		media == "application/gpx+xml" ||
 		media == "application/javascript" ||
 		media == "application/manifest+json" ||
 		media == "image/svg+xml"

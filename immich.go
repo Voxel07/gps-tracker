@@ -162,8 +162,8 @@ const (
 )
 
 func (a *app) loadPointsWindow(ctx context.Context, userID, from, to int64) ([]fix, error) {
-	rows, err := a.reader().QueryContext(ctx, "SELECT "+pointFields+" FROM points WHERE user_id = ? AND recorded_at BETWEEN ? AND ? ORDER BY recorded_at, id",
-		userID, from, to)
+	rows, err := a.reader().QueryContext(ctx, "SELECT "+pointFields+" FROM points WHERE "+rangeFilter+" ORDER BY COALESCE(edited_time, recorded_at), id",
+		userID, from, to+1, from, to+1)
 	if err != nil {
 		return nil, err
 	}
@@ -280,7 +280,18 @@ func (a *app) thumbnail(w http.ResponseWriter, r *http.Request, user account) {
 		http.NotFound(w, r)
 		return
 	}
-	res, err := a.immichRequest(r.Context(), key, http.MethodGet, "/assets/"+id+"/thumbnail?size=thumbnail", nil)
+	size := r.URL.Query().Get("size")
+	var maxBytes int64 = 5 << 20
+	switch size {
+	case "", "thumbnail":
+		size = "thumbnail"
+	case "preview":
+		maxBytes = 15 << 20
+	default:
+		problem(w, http.StatusBadRequest, "Unsupported image size")
+		return
+	}
+	res, err := a.immichRequest(r.Context(), key, http.MethodGet, "/assets/"+id+"/thumbnail?size="+size, nil)
 	if err != nil {
 		problem(w, http.StatusBadGateway, "Immich thumbnail unavailable")
 		return
@@ -294,11 +305,11 @@ func (a *app) thumbnail(w http.ResponseWriter, r *http.Request, user account) {
 		problem(w, http.StatusBadGateway, "Immich returned an unsupported thumbnail")
 		return
 	}
-	if res.ContentLength > 5<<20 {
+	if res.ContentLength > maxBytes {
 		problem(w, http.StatusBadGateway, "Immich returned a thumbnail that is too large")
 		return
 	}
 	w.Header().Set("Cache-Control", "private, max-age=3600")
 	w.Header().Add("Vary", "Cookie")
-	_, _ = io.Copy(w, io.LimitReader(res.Body, 5<<20))
+	_, _ = io.Copy(w, io.LimitReader(res.Body, maxBytes))
 }

@@ -310,11 +310,17 @@ func TestOIDCSignIn(t *testing.T) {
 	if response.Code != 303 || response.Header().Get("Location") != "/" {
 		t.Fatal("OIDC callback did not finish sign-in")
 	}
-	var session string
+	var session, refresh string
 	for _, cookie := range response.Result().Cookies() {
 		if cookie.Name == "__Host-gps_session" && cookie.Secure && cookie.HttpOnly {
 			session = cookie.Value
 		}
+		if cookie.Name == "__Host-gps_refresh" && cookie.Secure && cookie.HttpOnly {
+			refresh = cookie.Value
+		}
+	}
+	if session == "" || refresh == "" {
+		t.Fatal("OIDC callback did not set both session and refresh cookies")
 	}
 	status := request(t, handler, "GET", "/api/session", session, "", nil, 200)
 	if !strings.Contains(status.Body.String(), "New user") {
@@ -458,5 +464,200 @@ func TestTrimOverviewAndValidationEdgeCases(t *testing.T) {
 	}
 	if validServerURL("http://tracker.example", true) || validServerURL("https://user:pass@tracker.example", false) || validServerURL("https://tracker.example/path", true) {
 		t.Fatal("invalid server URL accepted")
+	}
+}
+
+func TestSessionAndRefreshTokens(t *testing.T) {
+	a, _, _ := testApp(t)
+	handler := a.routes()
+
+	// Issue a fresh session + refresh token pair for Alice (user 1)
+	rec := httptest.NewRecorder()
+	if _, err := a.issueTokens(context.Background(), rec, 1, nil); err != nil {
+		t.Fatal(err)
+	}
+	var session1, refresh1 string
+	for _, c := range rec.Result().Cookies() {
+		switch c.Name {
+		case "__Host-gps_session":
+			session1 = c.Value
+		case "__Host-gps_refresh":
+			refresh1 = c.Value
+		}
+	}
+	if session1 == "" || refresh1 == "" {
+		t.Fatalf("expected both session and refresh cookies, got session=%q refresh=%q", session1, refresh1)
+	}
+
+	// Expire session1 manually to simulate short-lived session expiration
+	if _, err := a.db.Exec("UPDATE sessions SET expires = ? WHERE hash = ?", time.Now().Add(-time.Minute).Unix(), tokenHash(session1)); err != nil {
+		t.Fatal(err)
+	}
+	// Session status reports refreshable=true
+	statusReq := httptest.NewRequest("GET", "/api/session", nil)
+	statusReq.AddCookie(&http.Cookie{Name: "__Host-gps_session", Value: session1})
+	statusReq.AddCookie(&http.Cookie{Name: "__Host-gps_refresh", Value: refresh1})
+	statusRec := httptest.NewRecorder()
+	handler.ServeHTTP(statusRec, statusReq)
+	statusBody := decode[struct {
+		User        *account
+		Refreshable bool
+	}](t, statusRec)
+	if statusBody.User != nil || !statusBody.Refreshable {
+		t.Fatalf("expected user=nil and refreshable=true, got %+v", statusBody)
+	}
+
+	// Refresh rotates both tokens
+	refreshReq := httptest.NewRequest("POST", "/auth/refresh", nil)
+	refreshReq.Header.Set("Origin", "https://tracker.example")
+	refreshReq.AddCookie(&http.Cookie{Name: "__Host-gps_refresh", Value: refresh1})
+	refreshRec := httptest.NewRecorder()
+	handler.ServeHTTP(refreshRec, refreshReq)
+	if refreshRec.Code != 200 {
+		t.Fatalf("refresh returned %d: %s", refreshRec.Code, refreshRec.Body.String())
+	}
+	var session2, refresh2 string
+	for _, c := range refreshRec.Result().Cookies() {
+		switch c.Name {
+		case "__Host-gps_session":
+			session2 = c.Value
+		case "__Host-gps_refresh":
+			refresh2 = c.Value
+		}
+	}
+	if session2 == "" || refresh2 == "" || session2 == session1 || refresh2 == refresh1 {
+		t.Fatal("refresh did not rotate session and refresh tokens")
+	}
+
+	// New session works on protected route
+	request(t, handler, "GET", "/api/keys", session2, "", nil, 200)
+
+	// Reusing old refresh1 revokes the entire token family
+	reuseReq := httptest.NewRequest("POST", "/auth/refresh", nil)
+	reuseReq.Header.Set("Origin", "https://tracker.example")
+	reuseReq.AddCookie(&http.Cookie{Name: "__Host-gps_refresh", Value: refresh1})
+	reuseRec := httptest.NewRecorder()
+	handler.ServeHTTP(reuseRec, reuseReq)
+	if reuseRec.Code != 401 {
+		t.Fatalf("reused refresh token returned %d, want 401", reuseRec.Code)
+	}
+
+	// Because the family was revoked, refresh2 and session2 must now also fail
+	afterReuse := httptest.NewRequest("POST", "/auth/refresh", nil)
+	afterReuse.Header.Set("Origin", "https://tracker.example")
+	afterReuse.AddCookie(&http.Cookie{Name: "__Host-gps_refresh", Value: refresh2})
+	afterReuseRec := httptest.NewRecorder()
+	handler.ServeHTTP(afterReuseRec, afterReuse)
+	if afterReuseRec.Code != 401 {
+		t.Fatalf("revoked family refresh2 returned %d, want 401", afterReuseRec.Code)
+	}
+	request(t, handler, "GET", "/api/keys", session2, "", nil, 401)
+}
+
+func TestRecentUploadsPointTimeEditAndStreamImport(t *testing.T) {
+	a, alice, bob := testApp(t)
+	handler := a.routes()
+
+	keyResp := request(t, handler, "POST", "/api/keys", alice, "", strings.NewReader(`{"name":"Pixel"}`), 201)
+	aliceKey := decode[struct{ Key string }](t, keyResp).Key
+
+	// Upload 12 points (including 1 duplicate)
+	base := time.Date(2025, 1, 2, 10, 0, 0, 0, time.UTC)
+	for i := range 11 {
+		payload := fmt.Sprintf(`{"lat":%.4f,"lon":0.1,"time":%q}`, 51.0+float64(i)*0.01, base.Add(time.Duration(i)*time.Minute).Format(time.RFC3339))
+		request(t, handler, "POST", "/api/upload", "", aliceKey, strings.NewReader(payload), 204)
+	}
+	dupPayload := fmt.Sprintf(`{"lat":51.1000,"lon":0.1,"time":%q}`, base.Add(10*time.Minute).Format(time.RFC3339))
+	request(t, handler, "POST", "/api/upload", "", aliceKey, strings.NewReader(dupPayload), 204)
+
+	recent := decode[[]recentUpload](t, request(t, handler, "GET", "/api/points/recent", alice, "", nil, 200))
+	if len(recent) != 10 {
+		t.Fatalf("expected 10 recent uploads, got %d", len(recent))
+	}
+	if !recent[0].Duplicate || recent[0].DeviceName != "Pixel" {
+		t.Fatalf("unexpected newest recent upload: %+v", recent[0])
+	}
+	bobRecent := decode[[]recentUpload](t, request(t, handler, "GET", "/api/points/recent", bob, "", nil, 200))
+	if len(bobRecent) != 0 {
+		t.Fatalf("recent uploads leaked to bob: %d", len(bobRecent))
+	}
+
+	// Edit a point's timestamp and coordinates, then revert
+	routePath := fmt.Sprintf("/api/route?from=%d&to=%d&detail=1", base.Add(-time.Hour).UnixMilli(), base.Add(2*time.Hour).UnixMilli())
+	route := decode[routeResult](t, request(t, handler, "GET", routePath, alice, "", nil, 200))
+	first := route.Points[0]
+	newTime := first.Time + 30_000
+	patchBody := fmt.Sprintf(`{"lat":51.55,"lon":0.22,"time":%d,"revision":%d}`, newTime, first.Revision)
+	request(t, handler, "PATCH", fmt.Sprintf("/api/points/%d", first.ID), alice, "", strings.NewReader(patchBody), 204)
+	afterEdit := decode[routeResult](t, request(t, handler, "GET", routePath, alice, "", nil, 200))
+	if afterEdit.Points[0].Time != newTime || afterEdit.Points[0].Lat != 51.55 || !afterEdit.Points[0].Corrected {
+		t.Fatalf("point time/coord edit did not persist: %+v", afterEdit.Points[0])
+	}
+	request(t, handler, "PATCH", fmt.Sprintf("/api/points/%d", first.ID), alice, "", strings.NewReader(`{"revert":true,"revision":1}`), 204)
+	afterRevert := decode[routeResult](t, request(t, handler, "GET", routePath, alice, "", nil, 200))
+	if afterRevert.Points[0].Time != first.Time || afterRevert.Points[0].Lat != first.Lat || afterRevert.Points[0].Corrected {
+		t.Fatalf("revert did not restore original time and coordinates: %+v", afterRevert.Points[0])
+	}
+
+	// Verify streaming GPX preview and import NDJSON output
+	const gpx = `<gpx xmlns="http://www.topografix.com/GPX/1/1"><trk><trkseg>
+		<trkpt lat="48.1" lon="11.5"><time>2025-03-01T10:00:00Z</time></trkpt>
+		<trkpt lat="48.2" lon="11.6"><time>2025-03-01T10:05:00Z</time></trkpt>
+	</trkseg></trk></gpx>`
+	for _, path := range []string{"/api/import?format=gpx&preview=1&stream=1", "/api/import?format=gpx&preview=0&stream=1"} {
+		rec := request(t, handler, "POST", path, alice, "", strings.NewReader(gpx), 200)
+		lines := strings.Split(strings.TrimSpace(rec.Body.String()), "\n")
+		if len(lines) < 2 {
+			t.Fatalf("expected streaming NDJSON events for %s, got %q", path, rec.Body.String())
+		}
+		var last importProgress
+		if err := json.Unmarshal([]byte(lines[len(lines)-1]), &last); err != nil {
+			t.Fatal(err)
+		}
+		if last.Type != "done" || last.Summary == nil || last.Summary.Added != 2 {
+			t.Fatalf("unexpected final stream event for %s: %+v", path, last)
+		}
+	}
+}
+
+func TestExportGPX(t *testing.T) {
+	a, alice, bob := testApp(t)
+	handler := a.routes()
+
+	const inputGPX = `<gpx xmlns="http://www.topografix.com/GPX/1/1"><trk>
+		<trkseg>
+			<trkpt lat="51.200000" lon="0.100000"><time>2025-04-01T09:00:00Z</time></trkpt>
+			<trkpt lat="51.210000" lon="0.110000"><time>2025-04-01T09:02:00Z</time></trkpt>
+		</trkseg>
+		<trkseg>
+			<trkpt lat="51.250000" lon="0.150000"><time>2025-04-01T11:00:00Z</time></trkpt>
+		</trkseg>
+		</trk><trk><trkseg>
+			<trkpt lat="52.000000" lon="1.000000"><time>2025-04-05T10:00:00Z</time></trkpt>
+		</trkseg></trk></gpx>`
+	request(t, handler, "POST", "/api/import?format=gpx", alice, "", strings.NewReader(inputGPX), 200)
+
+	from := time.Date(2025, 4, 1, 0, 0, 0, 0, time.UTC).UnixMilli()
+	to := time.Date(2025, 4, 2, 0, 0, 0, 0, time.UTC).UnixMilli()
+	path := fmt.Sprintf("/api/export?from=%d&to=%d", from, to)
+
+	// Invalid range and empty account/range checks
+	request(t, handler, "GET", fmt.Sprintf("/api/export?from=%d&to=%d", to, from), alice, "", nil, 400)
+	request(t, handler, "GET", path, bob, "", nil, 404)
+
+	// Export April 1 only (should contain 3 points, 2 trkseg, exclude April 5 point)
+	rec := request(t, handler, "GET", path, alice, "", nil, 200)
+	if !strings.Contains(rec.Header().Get("Content-Type"), "application/gpx+xml") {
+		t.Fatalf("unexpected Content-Type: %q", rec.Header().Get("Content-Type"))
+	}
+	if !strings.Contains(rec.Header().Get("Content-Disposition"), "gps-tracker-2025-04-01.gpx") {
+		t.Fatalf("unexpected Content-Disposition: %q", rec.Header().Get("Content-Disposition"))
+	}
+	points, invalid, err := parseGPX(strings.NewReader(rec.Body.String()), nil)
+	if err != nil {
+		t.Fatalf("exported GPX failed to parse: %v", err)
+	}
+	if len(points) != 3 || invalid != 0 || !points[2].BreakBefore {
+		t.Fatalf("exported GPX mismatch: len=%d invalid=%d breakBefore=%v", len(points), invalid, len(points) == 3 && points[2].BreakBefore)
 	}
 }
