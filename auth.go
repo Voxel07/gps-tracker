@@ -4,7 +4,9 @@ import (
 	"crypto/subtle"
 	"database/sql"
 	"errors"
+	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -51,18 +53,25 @@ func (a *app) callback(w http.ResponseWriter, r *http.Request) {
 	a.cookie(w, "gps_login", "", -1)
 	code := r.URL.Query().Get("code")
 	if a.oidc == nil || len(flow) != 3 || code == "" || subtle.ConstantTimeCompare([]byte(flow[0]), []byte(r.URL.Query().Get("state"))) != 1 {
+		log.Print("OIDC callback rejected: missing login cookie, authorization code, or state mismatch")
 		http.Redirect(w, r, "/?signin=failed", http.StatusSeeOther)
 		return
 	}
 	ctx := oidc.ClientContext(r.Context(), a.httpClient)
 	token, err := a.oauth.Exchange(ctx, code, oauth2.VerifierOption(flow[2]))
 	if err != nil {
+		log.Printf("OIDC token exchange failed: %v", err)
 		http.Redirect(w, r, "/?signin=failed", http.StatusSeeOther)
 		return
 	}
 	raw, _ := token.Extra("id_token").(string)
 	verified, err := a.oidc.Verify(ctx, raw)
-	if err != nil || verified.Subject == "" || verified.Nonce != flow[1] {
+	if err != nil || verified.Subject == "" || subtle.ConstantTimeCompare([]byte(verified.Nonce), []byte(flow[1])) != 1 {
+		if err != nil {
+			log.Printf("OIDC ID token verification failed: %v", err)
+		} else {
+			log.Print("OIDC ID token rejected: missing subject or nonce mismatch")
+		}
 		http.Redirect(w, r, "/?signin=failed", http.StatusSeeOther)
 		return
 	}
@@ -103,7 +112,7 @@ func (a *app) lookupSession(r *http.Request) (account, error) {
 	if token == "" {
 		return user, sql.ErrNoRows
 	}
-	err := a.db.QueryRowContext(r.Context(), `SELECT users.id, users.name FROM sessions JOIN users ON users.id = sessions.user_id
+	err := a.reader().QueryRowContext(r.Context(), `SELECT users.id, users.name FROM sessions JOIN users ON users.id = sessions.user_id
 		WHERE sessions.hash = ? AND sessions.expires > ?`, tokenHash(token), time.Now().Unix()).Scan(&user.ID, &user.Name)
 	return user, err
 }
@@ -158,7 +167,7 @@ type deviceKey struct {
 }
 
 func (a *app) listKeys(w http.ResponseWriter, r *http.Request, user account) {
-	rows, err := a.db.QueryContext(r.Context(), "SELECT id, name, last_used, revoked FROM device_keys WHERE user_id = ? ORDER BY id DESC", user.ID)
+	rows, err := a.reader().QueryContext(r.Context(), "SELECT id, name, last_used, revoked FROM device_keys WHERE user_id = ? ORDER BY id DESC", user.ID)
 	if err != nil {
 		serverError(w, err)
 		return
@@ -200,8 +209,13 @@ func (a *app) createKey(w http.ResponseWriter, r *http.Request, user account) {
 }
 
 func (a *app) revokeKey(w http.ResponseWriter, r *http.Request, user account) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		problem(w, http.StatusBadRequest, "Invalid device key ID")
+		return
+	}
 	result, err := a.db.ExecContext(r.Context(), "UPDATE device_keys SET revoked = ? WHERE id = ? AND user_id = ? AND revoked IS NULL",
-		time.Now().Unix(), r.PathValue("id"), user.ID)
+		time.Now().Unix(), id, user.ID)
 	if err != nil {
 		serverError(w, err)
 		return

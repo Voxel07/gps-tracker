@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto"
 	"crypto/aes"
@@ -27,12 +28,21 @@ import (
 
 func testApp(t *testing.T) (*app, string, string) {
 	t.Helper()
-	db, err := openDB(filepath.Join(t.TempDir(), "tracker.sqlite"))
+	dbPath := filepath.Join(t.TempDir(), "tracker.sqlite")
+	db, err := openDB(dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = db.Close() })
-	a := &app{db: db, origin: "https://tracker.example"}
+	readDB, err := openReadDB(dbPath)
+	if err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = readDB.Close()
+		_ = db.Close()
+	})
+	a := &app{db: db, readDB: readDB, origin: "https://tracker.example", importSem: make(chan struct{}, 2)}
 	runSQL := func(statement string, args ...any) {
 		t.Helper()
 		if _, err := db.Exec(statement, args...); err != nil {
@@ -76,9 +86,10 @@ func decode[T any](t *testing.T, response *httptest.ResponseRecorder) T {
 }
 
 type routeResult struct {
-	Count  int
-	Points []fix
-	Latest *fix
+	Count    int
+	Distance float64
+	Points   []fix
+	Latest   *fix
 }
 
 func TestAccountIsolationAndRouteEditing(t *testing.T) {
@@ -364,5 +375,88 @@ func TestImmichConnectionAndPhotoMatching(t *testing.T) {
 	request(t, handler, "DELETE", "/api/immich", alice, "", nil, 204)
 	if len(getPhotos(alice)) != 0 {
 		t.Fatal("Immich disconnect kept returning photos")
+	}
+}
+
+func TestSecurityHeadersCompressionAndDeletion(t *testing.T) {
+	a, alice, bob := testApp(t)
+	handler := a.routes()
+	const csv = "time,lat,lon\n2025-01-01T09:00:00Z,51.5,0.1\n2025-01-01T09:00:00Z,51.5,0.1\n2025-01-01T09:01:00Z,51.51,0.1\n"
+	preview := decode[importSummary](t, request(t, handler, "POST", "/api/import?format=csv&preview=1", alice, "", strings.NewReader(csv), 200))
+	if preview.Added != 2 || preview.Duplicates != 1 {
+		t.Fatalf("read-only preview miscounted in-file duplicate: %+v", preview)
+	}
+	request(t, handler, "POST", "/api/import?format=csv", alice, "", strings.NewReader(csv), 200)
+
+	// Verify gzip compression and security headers on /api/route
+	req := httptest.NewRequest("GET", "/api/route?from=1735689600000&to=1735776000000&detail=1", nil)
+	req.AddCookie(&http.Cookie{Name: "__Host-gps_session", Value: alice})
+	req.Header.Set("Accept-Encoding", "gzip")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("gzip route returned %d", rec.Code)
+	}
+	if rec.Header().Get("Content-Encoding") != "gzip" || rec.Header().Get("Content-Security-Policy") == "" || rec.Header().Get("Strict-Transport-Security") == "" {
+		t.Fatalf("missing gzip or security headers: %v", rec.Header())
+	}
+	gz, err := gzip.NewReader(rec.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var route routeResult
+	if err := json.NewDecoder(gz).Decode(&route); err != nil {
+		t.Fatal(err)
+	}
+	_ = gz.Close()
+	if route.Count != 2 || route.Distance < 1000 || route.Distance > 1200 {
+		t.Fatalf("unexpected route count/distance: count=%d distance=%f", route.Count, route.Distance)
+	}
+
+	// Verify CSRF Origin rejection on mutating requests
+	csrfReq := httptest.NewRequest("DELETE", fmt.Sprintf("/api/points/%d?revision=0", route.Points[0].ID), nil)
+	csrfReq.AddCookie(&http.Cookie{Name: "__Host-gps_session", Value: alice})
+	csrfReq.Header.Set("Origin", "https://evil.example")
+	csrfRec := httptest.NewRecorder()
+	handler.ServeHTTP(csrfRec, csrfReq)
+	if csrfRec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for cross-origin DELETE, got %d", csrfRec.Code)
+	}
+
+	// Verify deletePoint account isolation, revision check, and success
+	delPath := fmt.Sprintf("/api/points/%d", route.Points[0].ID)
+	request(t, handler, "DELETE", delPath, alice, "", nil, 400)
+	request(t, handler, "DELETE", delPath+"?revision=0", bob, "", nil, 409)
+	request(t, handler, "DELETE", delPath+"?revision=9", alice, "", nil, 409)
+	request(t, handler, "DELETE", delPath+"?revision=0", alice, "", nil, 204)
+	after := decode[routeResult](t, request(t, handler, "GET", "/api/route?from=1735689600000&to=1735776000000&detail=1", alice, "", nil, 200))
+	if after.Count != 1 {
+		t.Fatalf("point was not deleted, count=%d", after.Count)
+	}
+}
+
+func TestTrimOverviewAndValidationEdgeCases(t *testing.T) {
+	points := make([]fix, 5000)
+	for i := range points {
+		points[i] = fix{ID: int64(i + 1), Time: int64(i * 1000), Stream: "s1", BreakBefore: i == 2500}
+	}
+	trimmed := trimOverview(points, 100)
+	if len(trimmed) != 100 || trimmed[0].ID != 1 || trimmed[len(trimmed)-1].ID != 5000 {
+		t.Fatalf("trimOverview did not preserve endpoints: len=%d first=%d last=%d", len(trimmed), trimmed[0].ID, trimmed[len(trimmed)-1].ID)
+	}
+	var breaks int
+	for _, p := range trimmed {
+		if p.BreakBefore {
+			breaks++
+		}
+	}
+	if breaks != 1 {
+		t.Fatalf("trimOverview lost segment break: breaks=%d", breaks)
+	}
+	if !validServerURL("https://tracker.example", true) || !validServerURL("http://localhost:8080", true) {
+		t.Fatal("valid origin rejected")
+	}
+	if validServerURL("http://tracker.example", true) || validServerURL("https://user:pass@tracker.example", false) || validServerURL("https://tracker.example/path", true) {
+		t.Fatal("invalid server URL accepted")
 	}
 }

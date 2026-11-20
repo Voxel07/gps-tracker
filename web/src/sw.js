@@ -3,7 +3,11 @@ const assetList = __TRACKER_ASSETS__;
 const assets = new Set(assetList);
 
 self.addEventListener('install', (event) => {
-  event.waitUntil(caches.open(cacheName).then((cache) => cache.addAll(assetList)));
+  event.waitUntil(
+    caches.open(cacheName)
+      .then((cache) => cache.addAll(assetList))
+      .then(() => self.skipWaiting()),
+  );
 });
 
 self.addEventListener('activate', (event) => {
@@ -20,7 +24,17 @@ self.addEventListener('fetch', (event) => {
   if (request.method !== 'GET' || url.origin !== self.location.origin) return;
 
   if (request.mode === 'navigate' && url.pathname === '/') {
-    event.respondWith(fetch(request).catch(async () => (await caches.open(cacheName)).match('/')));
+    event.respondWith((async () => {
+      try {
+        const response = await fetch(request);
+        if (response.status >= 502 && response.status <= 504) {
+          return (await caches.open(cacheName)).match('/') ?? response;
+        }
+        return response;
+      } catch {
+        return (await caches.open(cacheName)).match('/') ?? Response.error();
+      }
+    })());
   } else if (!url.search && assets.has(url.pathname)) {
     event.respondWith((async () => (await (await caches.open(cacheName)).match(request)) ?? fetch(request))());
   }

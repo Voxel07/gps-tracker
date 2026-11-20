@@ -3,6 +3,11 @@ services:
     image: ${TRACKER_IMAGE:-gps-tracker:local}
     build: .
     restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     ports:
       - "${TRACKER_BIND:-127.0.0.1:8080}:8080"
     environment:

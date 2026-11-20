@@ -11,7 +11,7 @@ GPS Tracker shows your private GPSLogger history on an OpenStreetMap map. It ope
 
 The Compose volume `tracker-data` contains the database. Back it up with SQLite's online backup tool or stop the tracker before copying the volume. The Docker image runs as UID 10001. When substituting a bind mount, give that user write access to the mounted directory.
 
-To use a release image, set `TRACKER_IMAGE` to `ghcr.io/<owner>/<repo>:<version>`, then run `docker compose pull` and `docker compose up -d --no-build`. GitHub Actions checks pull requests and pushes, then publishes Linux AMD64 and ARM64 images for version tags such as `v0.1.0`.
+To use a release image, set `TRACKER_IMAGE` to `ghcr.io/<owner>/<repo>:<version>`, then run `docker compose pull` and `docker compose up -d --no-build`. GitHub Actions runs on version tags such as `v0.1.0` to verify the build and publish Linux AMD64 and ARM64 images.
 
 ## Connect a phone
 

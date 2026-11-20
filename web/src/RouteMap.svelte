@@ -25,7 +25,8 @@
   let map = $state.raw<L.Map>();
   let routeLayer: L.LayerGroup;
   let photoLayer: L.LayerGroup;
-  let editLayer: L.LayerGroup;
+  let editBaseLayer: L.LayerGroup;
+  let editActiveLayer: L.LayerGroup;
   let fitted = '';
 
   const dot = (kind: string, size: number) => L.divIcon({ className: 'map-dot ' + kind, iconSize: [size, size] });
@@ -42,7 +43,8 @@
     L.control.scale({ position: 'bottomleft', imperial: false }).addTo(instance);
     routeLayer = L.layerGroup().addTo(instance);
     photoLayer = L.layerGroup().addTo(instance);
-    editLayer = L.layerGroup().addTo(instance);
+    editBaseLayer = L.layerGroup().addTo(instance);
+    editActiveLayer = L.layerGroup().addTo(instance);
     instance.on('click', (event: L.LeafletMouseEvent) => {
       if (editing && adding && edge) onPlace(event.latlng.lat, normalizeLon(event.latlng.lng));
     });
@@ -120,40 +122,58 @@
 
   $effect(() => {
     if (!map) return;
-    editLayer.clearLayers();
+    editBaseLayer.clearLayers();
+    if (!editing) return;
+    const pickingGap = adding && edge === null;
+    for (let i = 0; i < route.points.length; i++) {
+      const point = route.points[i];
+      const next = route.points[i + 1];
+      const marker = L.circleMarker(loc(point), {
+        radius: 6,
+        color: '#ffffff',
+        weight: 2,
+        fillColor: point.estimated ? '#c1692c' : '#276d51',
+        fillOpacity: 1,
+        bubblingMouseEvents: false,
+      }).addTo(editBaseLayer);
+      marker.bindTooltip((point.estimated ? 'Estimated point · ' : '') + when(point.time), { direction: 'top', offset: [0, -6] });
+      marker.on('click', () => {
+        if (adding) {
+          if (pickingGap && next && next.stream === point.stream && point.time < next.time) onEdge({ left: point, right: next });
+        } else onSelect(point);
+      });
+      if (pickingGap && next?.breakBefore && next.stream === point.stream && point.time < next.time) {
+        L.polyline([loc(point), loc(next)], { weight: 18, opacity: 0, bubblingMouseEvents: false })
+          .on('click', () => onEdge({ left: point, right: next })).addTo(editBaseLayer);
+      }
+    }
+  });
+
+  $effect(() => {
+    if (!map) return;
+    editActiveLayer.clearLayers();
     if (!editing) return;
     if (edge) {
       L.polyline([loc(edge.left), ...waypoints.map(loc), loc(edge.right)], {
         color: '#ad5e20', weight: 4, dashArray: '5 6', interactive: false,
-      }).addTo(editLayer);
+      }).addTo(editActiveLayer);
     }
-    for (let i = 0; i < route.points.length; i++) {
-      const point = route.points[i];
-      const next = route.points[i + 1];
-      const chosen = selectedPoint?.id === point.id;
-      const marker = L.marker(chosen && draft ? loc(draft) : loc(point), {
-        icon: dot(chosen ? 'selected' : point.estimated ? 'estimate' : 'fix', chosen ? 21 : 15),
-        draggable: !adding && (!draft || chosen),
+    if (!adding && selectedPoint) {
+      const point = selectedPoint;
+      const marker = L.marker(draft ? loc(draft) : loc(point), {
+        icon: dot('selected', 21),
+        draggable: true,
         title: (point.estimated ? 'Estimated point · ' : '') + when(point.time),
-        zIndexOffset: chosen ? 500 : 0,
+        zIndexOffset: 500,
         autoPan: true,
-      }).addTo(editLayer);
-      marker.on('click', () => {
-        if (adding) {
-          if (!edge && next && next.stream === point.stream && point.time < next.time) onEdge({ left: point, right: next });
-        } else onSelect(point);
-      });
+      }).addTo(editActiveLayer);
       marker.on('dragend', () => {
         const position = marker.getLatLng();
         onMove(point, position.lat, normalizeLon(position.lng));
       });
-      if (adding && !edge && next?.breakBefore && next.stream === point.stream && point.time < next.time) {
-        L.polyline([loc(point), loc(next)], { weight: 18, opacity: 0, bubblingMouseEvents: false })
-          .on('click', () => onEdge({ left: point, right: next })).addTo(editLayer);
-      }
     }
     for (const waypoint of waypoints) {
-      L.marker(loc(waypoint), { icon: dot('waypoint', 18), interactive: false, zIndexOffset: 400 }).addTo(editLayer);
+      L.marker(loc(waypoint), { icon: dot('waypoint', 18), interactive: false, zIndexOffset: 400 }).addTo(editActiveLayer);
     }
   });
 </script>

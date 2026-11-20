@@ -67,9 +67,9 @@ small, .muted { color: var(--muted); }
 .panel p { font-size: 0.875rem; }
 .section-heading { display: flex; justify-content: space-between; align-items: center; gap: 0.55rem; }
 .section-heading button { min-height: 36px; }
-.stats { display: grid; grid-template-columns: 1fr 1fr; padding: 0.45rem 0 0.15rem; }
+.stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.4rem; padding: 0.45rem 0 0.15rem; }
 .stats > div, .setting-row > div:first-child { display: flex; flex-direction: column; gap: 0.2rem; }
-.stats strong { font-size: 1.35rem; font-variant-numeric: tabular-nums; }
+.stats strong { font-size: 1.15rem; font-variant-numeric: tabular-nums; }
 .stats small { font-size: 0.8rem; }
 .layers { margin-top: 1.4rem; }
 .layers h2 { margin-bottom: 0.65rem; }

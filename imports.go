@@ -21,12 +21,24 @@ type importSummary struct {
 	To         *int64 `json:"to"`
 }
 
+type fixKey struct {
+	time int64
+	lat  float64
+	lon  float64
+}
+
 func (a *app) importTrack(w http.ResponseWriter, r *http.Request, user account) {
 	format := r.URL.Query().Get("format")
 	if format != "gpx" && format != "csv" {
 		problem(w, http.StatusBadRequest, "Choose a GPX or CSV file")
 		return
 	}
+	release, ok := a.acquireImport()
+	if !ok {
+		problem(w, http.StatusTooManyRequests, "Another import is already in progress. Try again shortly.")
+		return
+	}
+	defer release()
 	preview := r.URL.Query().Get("preview") == "1"
 	body := http.MaxBytesReader(w, r.Body, 100<<20)
 	var points []fix
@@ -42,7 +54,55 @@ func (a *app) importTrack(w http.ResponseWriter, r *http.Request, user account) 
 		return
 	}
 	summary := importSummary{Valid: len(points), Invalid: invalid}
+	for _, point := range points {
+		if summary.From == nil || point.Time < *summary.From {
+			start := point.Time
+			summary.From = &start
+		}
+		if summary.To == nil || point.Time > *summary.To {
+			end := point.Time
+			summary.To = &end
+		}
+	}
 	ctx := r.Context()
+	if preview {
+		seen := make(map[fixKey]struct{}, len(points))
+		if summary.From != nil && summary.To != nil {
+			rows, err := a.reader().QueryContext(ctx,
+				"SELECT recorded_at, lat, lon FROM points WHERE user_id = ? AND estimated = 0 AND recorded_at BETWEEN ? AND ?",
+				user.ID, *summary.From, *summary.To)
+			if err != nil {
+				serverError(w, err)
+				return
+			}
+			for rows.Next() {
+				var key fixKey
+				if err := rows.Scan(&key.time, &key.lat, &key.lon); err != nil {
+					rows.Close()
+					serverError(w, err)
+					return
+				}
+				seen[key] = struct{}{}
+			}
+			if err := rows.Err(); err != nil {
+				rows.Close()
+				serverError(w, err)
+				return
+			}
+			rows.Close()
+		}
+		for _, point := range points {
+			key := fixKey{time: point.Time, lat: point.Lat, lon: point.Lon}
+			if _, exists := seen[key]; exists {
+				summary.Duplicates++
+			} else {
+				seen[key] = struct{}{}
+				summary.Added++
+			}
+		}
+		jsonResponse(w, http.StatusOK, summary)
+		return
+	}
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
 		serverError(w, err)
@@ -64,14 +124,6 @@ func (a *app) importTrack(w http.ResponseWriter, r *http.Request, user account) 
 		}
 		lastStream = point.Stream
 		breakPending = breakPending || point.BreakBefore
-		if summary.From == nil || point.Time < *summary.From {
-			start := point.Time
-			summary.From = &start
-		}
-		if summary.To == nil || point.Time > *summary.To {
-			end := point.Time
-			summary.To = &end
-		}
 		res, err := statement.ExecContext(ctx, user.ID, prefix+point.Stream, point.Time, point.Lat, point.Lon, false, breakPending)
 		if err != nil {
 			serverError(w, err)
@@ -84,11 +136,9 @@ func (a *app) importTrack(w http.ResponseWriter, r *http.Request, user account) 
 			breakPending = false
 		}
 	}
-	if !preview {
-		if err := tx.Commit(); err != nil {
-			serverError(w, err)
-			return
-		}
+	if err := tx.Commit(); err != nil {
+		serverError(w, err)
+		return
 	}
 	jsonResponse(w, http.StatusOK, summary)
 }

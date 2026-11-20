@@ -11,7 +11,7 @@ export type Point = {
   estimated: boolean;
   breakBefore: boolean;
 };
-export type Route = { points: Point[]; latest: Point | null; count: number };
+export type Route = { points: Point[]; latest: Point | null; count: number; distance: number };
 export type Photo = { id: string; time: number; lat: number; lon: number; estimated: boolean };
 export type Key = { id: number; name: string; lastUsed: number | null; revoked: number | null };
 export type Immich = { available: boolean; connected: boolean; url: string };
@@ -19,7 +19,14 @@ export type ImportSummary = { valid: number; invalid: number; duplicates: number
 export type Waypoint = { lat: number; lon: number; time: number };
 export type Edge = { left: Point; right: Point };
 
-export const emptyRoute: Route = { points: [], latest: null, count: 0 };
+export const emptyRoute: Route = { points: [], latest: null, count: 0, distance: 0 };
+
+export function formatDistance(meters: number): string {
+  if (!Number.isFinite(meters) || meters <= 0) return '0 m';
+  if (meters < 1000) return Math.round(meters) + ' m';
+  const km = meters / 1000;
+  return (km >= 100 ? Math.round(km).toLocaleString() : km.toFixed(1)) + ' km';
+}
 
 export function calendarRange(view: Exclude<View, 'Custom'>, date: Date): Range {
   const year = date.getFullYear();

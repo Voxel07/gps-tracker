@@ -3,18 +3,37 @@ package main
 import (
 	"database/sql"
 	"fmt"
+	"net/url"
+	"path/filepath"
+	"runtime"
+	"strings"
 )
 
+func sqliteDSN(path string, readOnly bool) string {
+	query := "_pragma=busy_timeout(5000)&_pragma=temp_store(MEMORY)"
+	if readOnly {
+		query = "mode=ro&_pragma=query_only(1)&" + query
+	} else {
+		query = "_txlock=immediate&_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&" + query
+	}
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs
+	}
+	slashed := filepath.ToSlash(path)
+	if !strings.HasPrefix(slashed, "/") {
+		slashed = "/" + slashed
+	}
+	u := url.URL{Scheme: "file", Path: slashed, RawQuery: query}
+	return u.String()
+}
+
 func openDB(path string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite", path)
+	db, err := sql.Open("sqlite", sqliteDSN(path, false))
 	if err != nil {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
 	_, err = db.Exec(`
-		PRAGMA busy_timeout = 5000;
-		PRAGMA foreign_keys = ON;
-		PRAGMA journal_mode = WAL;
 		CREATE TABLE IF NOT EXISTS users (
 			id INTEGER PRIMARY KEY, issuer TEXT NOT NULL, subject TEXT NOT NULL,
 			name TEXT NOT NULL, immich_key BLOB, UNIQUE (issuer, subject)
@@ -43,6 +62,23 @@ func openDB(path string) (*sql.DB, error) {
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("initialize SQLite: %w", err)
+	}
+	var version int
+	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err == nil && version == 0 {
+		_, _ = db.Exec("PRAGMA user_version = 1")
+	}
+	return db, nil
+}
+
+func openReadDB(path string) (*sql.DB, error) {
+	db, err := sql.Open("sqlite", sqliteDSN(path, true))
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(max(4, runtime.NumCPU()))
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("open read-only SQLite: %w", err)
 	}
 	return db, nil
 }

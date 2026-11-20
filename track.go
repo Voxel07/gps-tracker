@@ -59,6 +59,19 @@ func (a *app) upload(w http.ResponseWriter, r *http.Request) {
 		problem(w, http.StatusUnauthorized, "A GPSLogger API key is required")
 		return
 	}
+	ctx := r.Context()
+	keyHash := tokenHash(key)
+	var device, owner int64
+	var lastUsed sql.NullInt64
+	err := a.reader().QueryRowContext(ctx, "SELECT id, user_id, last_used FROM device_keys WHERE hash = ? AND revoked IS NULL", keyHash).Scan(&device, &owner, &lastUsed)
+	if errors.Is(err, sql.ErrNoRows) {
+		problem(w, http.StatusUnauthorized, "Invalid or revoked GPSLogger API key")
+		return
+	}
+	if err != nil {
+		serverError(w, err)
+		return
+	}
 	var input struct {
 		coordinates
 		Time string `json:"time"`
@@ -71,27 +84,34 @@ func (a *app) upload(w http.ResponseWriter, r *http.Request) {
 		problem(w, http.StatusBadRequest, "Latitude, longitude and an ISO 8601 recording time with a timezone are required")
 		return
 	}
-	ctx := r.Context()
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
 		serverError(w, err)
 		return
 	}
 	defer tx.Rollback()
-	var device, owner int64
-	err = tx.QueryRowContext(ctx, "UPDATE device_keys SET last_used = ? WHERE hash = ? AND revoked IS NULL RETURNING id, user_id",
-		time.Now().Unix(), tokenHash(key)).Scan(&device, &owner)
-	if errors.Is(err, sql.ErrNoRows) {
+	var active bool
+	err = tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM device_keys WHERE id = ? AND revoked IS NULL)", device).Scan(&active)
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	if !active {
 		problem(w, http.StatusUnauthorized, "Invalid or revoked GPSLogger API key")
 		return
 	}
-	if err == nil {
-		_, err = tx.ExecContext(ctx, insertFix, owner, "device-"+strconv.FormatInt(device, 10), ts, *input.Lat, *input.Lon, false, false)
+	now := time.Now().Unix()
+	if !lastUsed.Valid || now-lastUsed.Int64 >= 60 {
+		if _, err = tx.ExecContext(ctx, "UPDATE device_keys SET last_used = ? WHERE id = ?", now, device); err != nil {
+			serverError(w, err)
+			return
+		}
 	}
-	if err == nil {
-		err = tx.Commit()
+	if _, err = tx.ExecContext(ctx, insertFix, owner, "device-"+strconv.FormatInt(device, 10), ts, *input.Lat, *input.Lon, false, false); err != nil {
+		serverError(w, err)
+		return
 	}
-	if err != nil {
+	if err = tx.Commit(); err != nil {
 		serverError(w, err)
 		return
 	}
@@ -129,7 +149,7 @@ func (a *app) getRoute(w http.ResponseWriter, r *http.Request, user account) {
 	}
 	detail := r.URL.Query().Get("detail") == "1"
 	ctx := r.Context()
-	tx, err := a.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	tx, err := a.reader().BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		serverError(w, err)
 		return
@@ -156,6 +176,7 @@ func (a *app) getRoute(w http.ResponseWriter, r *http.Request, user account) {
 	var last fix
 	var latest *fix
 	var index int64
+	var distance float64
 	appendPoint := func(point fix) {
 		if len(points) == 0 || points[len(points)-1].ID != point.ID {
 			points = append(points, point)
@@ -176,6 +197,9 @@ func (a *app) getRoute(w http.ResponseWriter, r *http.Request, user account) {
 		}
 		newStream := last.ID == 0 || point.Stream != last.Stream
 		point.BreakBefore = !newStream && isGap(last, point)
+		if !newStream && !point.BreakBefore {
+			distance += distanceMeters(last.Lat, last.Lon, point.Lat, point.Lon)
+		}
 		if newStream || point.BreakBefore {
 			if last.ID != 0 {
 				appendPoint(last)
@@ -200,7 +224,7 @@ func (a *app) getRoute(w http.ResponseWriter, r *http.Request, user account) {
 		serverError(w, err)
 		return
 	}
-	jsonResponse(w, http.StatusOK, map[string]any{"points": points, "latest": latest, "count": count})
+	jsonResponse(w, http.StatusOK, map[string]any{"points": points, "latest": latest, "count": count, "distance": math.Round(distance)})
 }
 
 // Carry breaks forward when decimation removes the original segment boundary.
@@ -226,6 +250,11 @@ func trimOverview(points []fix, limit int) []fix {
 }
 
 func (a *app) movePoint(w http.ResponseWriter, r *http.Request, user account) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		problem(w, http.StatusBadRequest, "Invalid point ID")
+		return
+	}
 	var input struct {
 		coordinates
 		Revision int
@@ -242,7 +271,30 @@ func (a *app) movePoint(w http.ResponseWriter, r *http.Request, user account) {
 		input.Lat, input.Lon = nil, nil
 	}
 	result, err := a.db.ExecContext(r.Context(), `UPDATE points SET edited_lat = ?, edited_lon = ?, revision = revision + 1
-		WHERE id = ? AND user_id = ? AND revision = ?`, input.Lat, input.Lon, r.PathValue("id"), user.ID, input.Revision)
+		WHERE id = ? AND user_id = ? AND revision = ?`, input.Lat, input.Lon, id, user.ID, input.Revision)
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	if count, _ := result.RowsAffected(); count == 0 {
+		problem(w, http.StatusConflict, "Point unavailable or changed. Refresh the route and try again.")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (a *app) deletePoint(w http.ResponseWriter, r *http.Request, user account) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		problem(w, http.StatusBadRequest, "Invalid point ID")
+		return
+	}
+	revision, err := strconv.Atoi(r.URL.Query().Get("revision"))
+	if err != nil {
+		problem(w, http.StatusBadRequest, "Point revision is required")
+		return
+	}
+	result, err := a.db.ExecContext(r.Context(), "DELETE FROM points WHERE id = ? AND user_id = ? AND revision = ?", id, user.ID, revision)
 	if err != nil {
 		serverError(w, err)
 		return

@@ -3,7 +3,7 @@
   import RouteMap from './RouteMap.svelte';
   import Settings from './Settings.svelte';
   import Import from './Import.svelte';
-  import { adjacent, api, calendarRange, emptyRoute, heading, json, localDateTime, localDay, message, rangeQuery, when } from './model';
+  import { adjacent, api, calendarRange, emptyRoute, formatDistance, heading, json, localDateTime, localDay, message, rangeQuery, when } from './model';
   import type { Edge, Immich, ImportSummary, Photo, Point, Range, Route, View, Waypoint } from './model';
 
   const views: View[] = ['Day', 'Month', 'Year', 'Custom'];
@@ -38,6 +38,7 @@
   let adding = $state(false);
   let edge = $state<Edge | null>(null);
   let selectedPoint = $state<Point | null>(null);
+  let confirmDelete = $state(false);
   let draft = $state<Waypoint | null>(null);
   let waypoints = $state<Waypoint[]>([]);
 
@@ -125,6 +126,7 @@
     edge = null;
     waypoints = [];
     selectedPoint = null;
+    confirmDelete = false;
     draft = null;
     editError = '';
   }
@@ -290,7 +292,7 @@
                 {/if}
               </div>
             {:else}
-              <p>Drag a marker to correct its position, or add waypoints between existing fixes.</p>
+              <p>Tap a point to select it, then drag it to correct its position, delete it, or add waypoints between existing fixes.</p>
               {#if selectedPoint}
                 <p class="muted">{when(selectedPoint.time)}{selectedPoint.estimated ? ' · Estimated point' : ''}</p>
                 <div class="edit-actions">
@@ -299,10 +301,20 @@
                     <button class="primary" disabled={saving} onclick={() => saveEdit(() => api('/api/points/' + selectedPoint!.id, json('PATCH', {
                       ...draft, revision: selectedPoint!.revision,
                     })), 'Point saved.')}>Save point</button>
-                  {:else if selectedPoint.corrected}
-                    <button disabled={saving} onclick={() => saveEdit(() => api('/api/points/' + selectedPoint!.id, json('PATCH', {
-                      revert: true, revision: selectedPoint!.revision,
-                    })), 'Original position restored.')}>Restore original position</button>
+                  {:else}
+                    {#if selectedPoint.corrected}
+                      <button disabled={saving} onclick={() => saveEdit(() => api('/api/points/' + selectedPoint!.id, json('PATCH', {
+                        revert: true, revision: selectedPoint!.revision,
+                      })), 'Original position restored.')}>Restore original position</button>
+                    {/if}
+                    {#if confirmDelete}
+                      <button disabled={saving} onclick={() => confirmDelete = false}>Cancel</button>
+                      <button class="danger" disabled={saving} onclick={() => saveEdit(() => api('/api/points/' + selectedPoint!.id + '?revision=' + selectedPoint!.revision, {
+                        method: 'DELETE',
+                      }), 'Point deleted.')}>Confirm delete</button>
+                    {:else}
+                      <button class="danger" disabled={saving} onclick={() => confirmDelete = true}>Delete point</button>
+                    {/if}
                   {/if}
                 </div>
               {/if}
@@ -319,6 +331,7 @@
             {:else}
               <div class="stats">
                 <div><strong>{route.count.toLocaleString()}</strong><small>Points</small></div>
+                <div><strong>{formatDistance(route.distance)}</strong><small>Distance</small></div>
                 <div><strong>{route.latest ? new Date(route.latest.time).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' }) : '–'}</strong><small>Latest point</small></div>
               </div>
             {/if}
@@ -340,7 +353,7 @@
     <section class="map-area" aria-label="Map">
       <RouteMap route={offline || !user ? emptyRoute : route} photos={offline || !user ? [] : photos}
         fitKey={displayedRangeKey} editing={editing && !offline} {adding} {edge} {draft} {selectedPoint} {waypoints}
-        onSelect={(point) => { if (!draft || selectedPoint?.id === point.id) selectedPoint = point; }}
+        onSelect={(point) => { if (!draft || selectedPoint?.id === point.id) { selectedPoint = point; confirmDelete = false; } }}
         onMove={(point, lat, lon) => { if (!saving) { selectedPoint = point; draft = { lat, lon, time: point.time }; } }}
         onEdge={(value) => edge = value} onPlace={placeWaypoint} />
     </section>
