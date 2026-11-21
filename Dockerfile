@@ -16,7 +16,7 @@ COPY *.go ./
 COPY --from=frontend /build/public/dist/ public/dist/
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/gps-tracker .
 
-FROM alpine:3.23.8@sha256:469c9ea410b9215eaee7976ba6c0639039b444be8e5d638f7abbada189971eb2
+FROM alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf
 RUN apk add --no-cache ca-certificates \
     && addgroup -S -g 10001 tracker \
     && adduser -S -D -H -u 10001 -G tracker tracker \
