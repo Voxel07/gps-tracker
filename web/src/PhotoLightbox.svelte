@@ -1,4 +1,5 @@
 <script lang="ts">
+  import Icon from './Icon.svelte';
   import { onMount } from 'svelte';
   import { formatCoords, when } from './model';
   import type { Photo } from './model';
@@ -63,14 +64,14 @@
           </small>
         </div>
         <div class="lightbox-actions">
-          <button type="button" onclick={() => { onLocate(photo); onClose(); }}>Locate on map</button>
-          <button type="button" class="square" onclick={onClose} aria-label="Close preview">×</button>
+          <button type="button" onclick={() => { onLocate(photo); onClose(); }}><Icon name="pin" />Locate on map</button>
+          <button type="button" class="square" onclick={onClose} aria-label="Close preview"><Icon name="close" /></button>
         </div>
       </header>
 
       <div class="lightbox-stage">
         {#if photos.length > 1}
-          <button type="button" class="lightbox-nav prev" onclick={prev} aria-label="Previous photo">‹</button>
+          <button type="button" class="lightbox-nav prev" onclick={prev} aria-label="Previous photo"><Icon name="left" /></button>
         {/if}
 
         {#if !loaded && !failed}
@@ -96,7 +97,7 @@
         {/if}
 
         {#if photos.length > 1}
-          <button type="button" class="lightbox-nav next" onclick={next} aria-label="Next photo">›</button>
+          <button type="button" class="lightbox-nav next" onclick={next} aria-label="Next photo"><Icon name="right" /></button>
         {/if}
       </div>
     </div>

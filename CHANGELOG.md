@@ -5,6 +5,21 @@ All notable changes to GPS Tracker are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.4] - 2026-11-21
+
+### Changed
+- **Preserve map zoom in edit mode**: Entering or leaving route edit mode no longer resets the current zoom level or map view.
+- **Direct live point & route editing**: Dragging a point or editing its coordinates now moves both the point and its attached route segments in real time, supporting edits across multiple points before saving.
+- **New Designe**: Rework the color theme and layout.
+- **Edit panel controls**: Moved Save and Cancel buttons to the top of the Edit route panel, and updated **Done** to automatically save all pending edited points and newly placed waypoints.
+- **Solid palette styling**: Replaced all CSS gradients across the topbar, avatars, and progress bar with solid colors from the `#060517`, `#cf5c36`, and `#efc88b` palette.
+- **Single-page Profile view**: Removed the section tabs so all profile sections (Import, Export GPX, GPSLogger devices, Immich, and Recent uploads) appear together on one centered page.
+
+### Removed
+- **CARTO map layers**: Removed the CARTO Voyager and CARTO Dark map views and their CSP `img-src` host (retaining OpenStreetMap, OpenTopoMap, and Esri Satellite).
+- **Route summary Export GPX button**: Removed the duplicate Export GPX button from the Route summary panel (GPX export remains in the Profile page).
+- **Profile Appearance section**: Removed the redundant Appearance section and theme button from the Profile page (the theme toggle remains in the topbar).
+
 ## [0.0.3] - 2026-11-21
 
 ### Added

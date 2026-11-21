@@ -1,4 +1,5 @@
 <script lang="ts">
+  import Icon from './Icon.svelte';
   import { onMount } from 'svelte';
   import L from 'leaflet';
   import { mapLayers, when } from './model';
@@ -9,13 +10,14 @@
     photos: Photo[];
     fitKey: string;
     mapLayer: MapLayerId;
+    routeColors: { route: string; gap: string };
     showRoute: boolean;
     showGaps: boolean;
     focusPoint: { lat: number; lon: number; seq: number } | null;
     editing: boolean;
     adding: boolean;
     selectedPoint: Point | null;
-    draft: Waypoint | null;
+    pendingEdits: Record<number, Waypoint>;
     edge: Edge | null;
     waypoints: Waypoint[];
     onSelect: (point: Point) => void;
@@ -32,13 +34,14 @@
     photos,
     fitKey,
     mapLayer,
+    routeColors,
     showRoute,
     showGaps,
     focusPoint,
     editing,
     adding,
     selectedPoint,
-    draft,
+    pendingEdits,
     edge,
     waypoints,
     onSelect,
@@ -60,12 +63,24 @@
   let fitted = '';
   let lastFocusSeq = 0;
   let layerMenuOpen = $state(false);
+  let liveDrag = $state<{ id: number; lat: number; lon: number } | null>(null);
 
   const activeLayerOption = $derived(mapLayers.find((l) => l.id === mapLayer) ?? mapLayers[0]);
 
   const dot = (kind: string, size: number) => L.divIcon({ className: 'map-dot ' + kind, iconSize: [size, size] });
   const loc = (point: { lat: number; lon: number }): L.LatLngTuple => [point.lat, point.lon];
   const normalizeLon = (lon: number) => ((lon + 180) % 360 + 360) % 360 - 180;
+
+  function resolvedCoords(point: Point): { lat: number; lon: number } {
+    if (liveDrag && liveDrag.id === point.id) {
+      return { lat: liveDrag.lat, lon: liveDrag.lon };
+    }
+    const pending = pendingEdits[point.id];
+    if (pending) {
+      return { lat: pending.lat, lon: pending.lon };
+    }
+    return { lat: point.lat, lon: point.lon };
+  }
 
   onMount(() => {
     const instance = L.map(node, { zoomControl: false, preferCanvas: true, scrollWheelZoom: true }).setView([50.4, 10.3], 5);
@@ -123,20 +138,21 @@
     if (!map) return;
     routeLayer.clearLayers();
     const points = route.points;
-    const routeColor = '#cf5c36';
-    const gapColor = activeLayerOption.isDark ? '#efc88b' : '#8d6442';
+    const { route: routeColor, gap: gapColor } = routeColors;
     let run: L.LatLngTuple[] = [];
     for (let i = 0; i < points.length; i++) {
       const point = points[i];
       const previous = points[i - 1];
-      if (previous && (previous.stream !== point.stream || point.breakBefore || Math.abs(point.lon - previous.lon) > 180)) {
+      const pointPos = resolvedCoords(point);
+      const prevPos = previous ? resolvedCoords(previous) : null;
+      if (previous && prevPos && (previous.stream !== point.stream || point.breakBefore || Math.abs(pointPos.lon - prevPos.lon) > 180)) {
         if (showRoute) line(run, routeColor);
         run = [];
-        if (showGaps && point.breakBefore && previous.stream === point.stream && Math.abs(point.lon - previous.lon) <= 180) {
-          line([loc(previous), loc(point)], gapColor, true);
+        if (showGaps && point.breakBefore && previous.stream === point.stream && Math.abs(pointPos.lon - prevPos.lon) <= 180) {
+          line([loc(prevPos), loc(pointPos)], gapColor, true);
         }
       }
-      run.push(loc(point));
+      run.push(loc(pointPos));
     }
     if (showRoute) line(run, routeColor);
     if (route.latest && !editing && showRoute) {
@@ -196,40 +212,50 @@
       const point = route.points[i];
       const next = route.points[i + 1];
       const prev = route.points[i - 1];
+      const pos = pendingEdits[point.id] ?? point;
+      const isSelected = !adding && selectedPoint?.id === point.id;
+      const isPending = point.id in pendingEdits;
       const isAnchor = edge && (point.id === edge.left.id || point.id === edge.right.id);
-      const marker = L.circleMarker(loc(point), {
-        radius: isAnchor ? 8 : 6,
-        color: isAnchor ? '#060517' : '#ffffff',
-        weight: isAnchor ? 3 : 2,
-        fillColor: isAnchor ? '#efc88b' : (point.estimated ? '#efc88b' : '#cf5c36'),
-        fillOpacity: 1,
-        bubblingMouseEvents: false,
-      }).addTo(editBaseLayer);
-      marker.bindTooltip((point.estimated ? 'Estimated point · ' : '') + when(point.time), { direction: 'top', offset: [0, -6] });
-      marker.on('click', () => {
-        if (adding) {
-          if (pickingEdge) {
-            if (next && next.stream === point.stream && point.time < next.time) {
-              onEdge({ left: point, right: next });
-            } else if (prev && prev.stream === point.stream && prev.time < point.time) {
-              onEdge({ left: prev, right: point });
-            }
-          }
-        } else {
-          onSelect(point);
-        }
-      });
-      // Allow clicking ANY consecutive segment (solid OR dashed gap) in the same stream when picking where to insert points
-      if (pickingEdge && next && next.stream === point.stream && point.time < next.time && Math.abs(next.lon - point.lon) <= 180) {
-        const hitLine = L.polyline([loc(point), loc(next)], {
-          weight: 18,
-          opacity: 0,
+
+      if (!isSelected) {
+        const marker = L.circleMarker(loc(pos), {
+          radius: isAnchor ? 8 : isPending ? 7 : 6,
+          color: isAnchor || isPending ? '#10151b' : '#ffffff',
+          weight: isAnchor || isPending ? 3 : 2,
+          fillColor: isAnchor || isPending ? '#ffc895' : (point.estimated ? '#ffc895' : '#f37832'),
+          fillOpacity: 1,
           bubblingMouseEvents: false,
-          className: 'edge-hit-target',
+        }).addTo(editBaseLayer);
+        marker.bindTooltip((isPending ? 'Unsaved edit · ' : point.estimated ? 'Estimated point · ' : '') + when(pos.time), { direction: 'top', offset: [0, -6] });
+        marker.on('click', () => {
+          if (adding) {
+            if (pickingEdge) {
+              if (next && next.stream === point.stream && point.time < next.time) {
+                onEdge({ left: point, right: next });
+              } else if (prev && prev.stream === point.stream && prev.time < point.time) {
+                onEdge({ left: prev, right: point });
+              }
+            }
+          } else {
+            onSelect(point);
+          }
         });
-        hitLine.bindTooltip('Tap to insert points between these fixes', { sticky: true });
-        hitLine.on('click', () => onEdge({ left: point, right: next }));
-        hitLine.addTo(editBaseLayer);
+      }
+
+      // Allow clicking ANY consecutive segment (solid OR dashed gap) in the same stream when picking where to insert points
+      if (pickingEdge && next && next.stream === point.stream && point.time < next.time) {
+        const nextPos = pendingEdits[next.id] ?? next;
+        if (Math.abs(nextPos.lon - pos.lon) <= 180) {
+          const hitLine = L.polyline([loc(pos), loc(nextPos)], {
+            weight: 18,
+            opacity: 0,
+            bubblingMouseEvents: false,
+            className: 'edge-hit-target',
+          });
+          hitLine.bindTooltip('Tap to insert points between these fixes', { sticky: true });
+          hitLine.on('click', () => onEdge({ left: point, right: next }));
+          hitLine.addTo(editBaseLayer);
+        }
       }
     }
   });
@@ -237,10 +263,17 @@
   $effect(() => {
     if (!map) return;
     editActiveLayer.clearLayers();
-    if (!editing) return;
-    if (edge) {
-      L.polyline([loc(edge.left), ...waypoints.map(loc), loc(edge.right)], {
-        color: '#efc88b',
+    if (!editing) {
+      liveDrag = null;
+      return;
+    }
+    let previewLine: L.Polyline | null = null;
+    const waypointCoords = waypoints.map(loc);
+    const leftPos = edge ? (pendingEdits[edge.left.id] ?? edge.left) : null;
+    const rightPos = edge ? (pendingEdits[edge.right.id] ?? edge.right) : null;
+    if (edge && leftPos && rightPos) {
+      previewLine = L.polyline([loc(leftPos), ...waypointCoords, loc(rightPos)], {
+        color: routeColors.gap,
         weight: 4,
         dashArray: '6 6',
         interactive: false,
@@ -248,16 +281,24 @@
     }
     if (!adding && selectedPoint) {
       const point = selectedPoint;
-      const marker = L.marker(draft ? loc(draft) : loc(point), {
+      const activePos = pendingEdits[point.id] ?? point;
+      const marker = L.marker(loc(activePos), {
         icon: dot('selected', 22),
         draggable: true,
-        title: (point.estimated ? 'Estimated point · ' : '') + when(point.time),
+        title: (point.estimated ? 'Estimated point · ' : '') + when(activePos.time),
         zIndexOffset: 500,
         autoPan: true,
       }).addTo(editActiveLayer);
+      marker.on('drag', () => {
+        const position = marker.getLatLng();
+        liveDrag = { id: point.id, lat: position.lat, lon: normalizeLon(position.lng) };
+      });
       marker.on('dragend', () => {
         const position = marker.getLatLng();
-        onMove(point, position.lat, normalizeLon(position.lng));
+        const lat = position.lat;
+        const lon = normalizeLon(position.lng);
+        liveDrag = null;
+        onMove(point, lat, lon);
       });
     }
     waypoints.forEach((waypoint, index) => {
@@ -267,6 +308,13 @@
         title: 'New point ' + (index + 1) + ' (drag to move)',
         zIndexOffset: 450,
       }).addTo(editActiveLayer);
+      marker.on('drag', () => {
+        if (previewLine && leftPos && rightPos) {
+          const pos = marker.getLatLng();
+          waypointCoords[index] = [pos.lat, normalizeLon(pos.lng)];
+          previewLine.setLatLngs([loc(leftPos), ...waypointCoords, loc(rightPos)]);
+        }
+      });
       marker.on('dragend', () => {
         const position = marker.getLatLng();
         onMoveWaypoint(index, position.lat, normalizeLon(position.lng));
@@ -275,7 +323,7 @@
   });
 </script>
 
-<div class="map-wrapper">
+<div class="map-wrapper" data-layer={mapLayer}>
   <div class="leaflet-host" class:placing={editing && adding && edge !== null} bind:this={node} aria-label="GPS route map"></div>
 
   <div class="map-layer-control">
@@ -286,7 +334,7 @@
       aria-label="Choose map layer"
       onclick={() => layerMenuOpen = !layerMenuOpen}
     >
-      <span aria-hidden="true">◫</span> {activeLayerOption.shortLabel}
+      <Icon name="layers" /> {activeLayerOption.shortLabel} <Icon name={layerMenuOpen ? 'up' : 'down'} size={13} />
     </button>
     {#if layerMenuOpen}
       <div class="layer-popover" role="menu" aria-label="Base map layers">
@@ -299,6 +347,7 @@
             onclick={() => { onChangeLayer(option.id); layerMenuOpen = false; }}
           >
             {option.label}
+            {#if mapLayer === option.id}<Icon name="check" size={15} />{/if}
           </button>
         {/each}
       </div>

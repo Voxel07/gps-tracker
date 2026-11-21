@@ -1,6 +1,6 @@
 export type View = 'Day' | 'Month' | 'Year' | 'Custom';
 export type Theme = 'dark' | 'light';
-export type MapLayerId = 'osm' | 'light' | 'dark' | 'topo' | 'satellite';
+export type MapLayerId = 'osm' | 'topo' | 'satellite';
 
 export type MapLayerOption = {
   id: MapLayerId;
@@ -23,25 +23,6 @@ export const mapLayers: MapLayerOption[] = [
     maxZoom: 19,
   },
   {
-    id: 'light',
-    label: 'CARTO Voyager',
-    shortLabel: 'Light',
-    url: 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png',
-    attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> © <a href="https://carto.com/attributions">CARTO</a>',
-    maxZoom: 20,
-    subdomains: 'abcd',
-  },
-  {
-    id: 'dark',
-    label: 'CARTO Dark',
-    shortLabel: 'Dark',
-    url: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
-    attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> © <a href="https://carto.com/attributions">CARTO</a>',
-    maxZoom: 20,
-    subdomains: 'abcd',
-    isDark: true,
-  },
-  {
     id: 'topo',
     label: 'OpenTopoMap',
     shortLabel: 'Topo',
@@ -60,6 +41,14 @@ export const mapLayers: MapLayerOption[] = [
     isDark: true,
   },
 ];
+
+export function mapRouteColors(layer: MapLayerId, theme: Theme) {
+  const darkMap = mapLayers.find((option) => option.id === layer)?.isDark || (layer === 'osm' && theme === 'dark');
+  return {
+    route: darkMap ? '#ff853e' : '#bd4d12',
+    gap: darkMap ? '#f5cfac' : '#805336',
+  };
+}
 
 export type Range = { from: number; to: number };
 export type Point = {
@@ -118,7 +107,7 @@ export function getInitialTheme(): Theme {
     const saved = localStorage.getItem(THEME_KEY);
     if (saved === 'dark' || saved === 'light') return saved;
   } catch { /* ignore storage errors */ }
-  return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  return 'dark';
 }
 
 export function applyTheme(theme: Theme) {
@@ -126,18 +115,18 @@ export function applyTheme(theme: Theme) {
   const colorScheme = document.querySelector('meta[name="color-scheme"]');
   if (colorScheme) colorScheme.setAttribute('content', theme);
   const themeColor = document.querySelector('meta[name="theme-color"]');
-  if (themeColor) themeColor.setAttribute('content', theme === 'dark' ? '#060517' : '#060517');
+  if (themeColor) themeColor.setAttribute('content', theme === 'dark' ? '#010409' : '#f4f6f8');
   try {
     localStorage.setItem(THEME_KEY, theme);
   } catch { /* ignore */ }
 }
 
-export function getInitialMapLayer(theme: Theme): MapLayerId {
+export function getInitialMapLayer(): MapLayerId {
   try {
     const saved = localStorage.getItem(LAYER_KEY) as MapLayerId | null;
     if (saved && mapLayers.some((layer) => layer.id === saved)) return saved;
   } catch { /* ignore */ }
-  return theme === 'dark' ? 'dark' : 'osm';
+  return 'osm';
 }
 
 export function saveMapLayer(id: MapLayerId) {

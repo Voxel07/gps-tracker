@@ -196,7 +196,7 @@ func validServerURL(value string, originOnly bool) bool {
 	return u.Scheme == "http" && (!originOnly || u.Hostname() == "localhost" || u.Hostname() == "127.0.0.1" || u.Hostname() == "::1")
 }
 
-const contentSecurityPolicy = "default-src 'self'; img-src 'self' https://tile.openstreetmap.org https://*.basemaps.cartocdn.com https://*.tile.opentopomap.org https://server.arcgisonline.com data:; style-src 'self' 'unsafe-inline'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+const contentSecurityPolicy = "default-src 'self'; img-src 'self' https://tile.openstreetmap.org https://*.tile.opentopomap.org https://server.arcgisonline.com data:; style-src 'self' 'unsafe-inline'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
 
 func (a *app) routes() http.Handler {
 	mux := http.NewServeMux()

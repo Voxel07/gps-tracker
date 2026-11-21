@@ -1,5 +1,7 @@
 <script lang="ts">
+  import Icon from './Icon.svelte';
   import { onMount } from 'svelte';
+  import brandMark from './tracker.svg';
   import RouteMap from './RouteMap.svelte';
   import ProfilePage from './ProfilePage.svelte';
   import PhotoLightbox from './PhotoLightbox.svelte';
@@ -8,7 +10,6 @@
     api,
     applyTheme,
     calendarRange,
-    downloadGPX,
     emptyRoute,
     formatCoords,
     formatDistance,
@@ -19,6 +20,7 @@
     localDateTime,
     localDay,
     mapLayers,
+    mapRouteColors,
     message,
     onSessionUpdate,
     rangeQuery,
@@ -48,7 +50,8 @@
   const initialTheme = getInitialTheme();
 
   let theme = $state<Theme>(initialTheme);
-  let mapLayer = $state<MapLayerId>(getInitialMapLayer(initialTheme));
+  let mapLayer = $state<MapLayerId>(getInitialMapLayer());
+  const routeColors = $derived(mapRouteColors(mapLayer, theme));
   let showRoute = $state(true);
   let showGaps = $state(true);
   let showPhotos = $state(true);
@@ -82,7 +85,6 @@
   let focusSeq = 0;
 
   let loading = $state(false);
-  let exporting = $state(false);
   let saving = $state(false);
   let feedback = $state('');
   let routeError = $state('');
@@ -95,7 +97,7 @@
   let edge = $state<Edge | null>(null);
   let selectedPoint = $state<Point | null>(null);
   let confirmDelete = $state(false);
-  let draft = $state<Waypoint | null>(null);
+  let pendingEdits = $state<Record<number, Waypoint>>({});
   let waypoints = $state<Waypoint[]>([]);
 
   const selected = $derived(view === 'Custom' ? custom : calendarRange(view, anchor));
@@ -103,6 +105,15 @@
   const rangeKey = $derived(rangeQuery(range));
   const editing = $derived(editRange !== null);
   const current = $derived(view !== 'Custom' && calendarRange(view, new Date()).from === selected.from);
+
+  const pendingEditIds = $derived(Object.keys(pendingEdits).map(Number));
+  const pendingEditCount = $derived(pendingEditIds.length);
+  const hasUnsavedWork = $derived(pendingEditCount > 0 || (adding && edge !== null && waypoints.length > 0));
+
+  const selectedDraft = $derived.by(() => {
+    if (!selectedPoint) return null;
+    return pendingEdits[selectedPoint.id] ?? { lat: selectedPoint.lat, lon: selectedPoint.lon, time: selectedPoint.time };
+  });
 
   const selectedNeighbors = $derived.by(() => {
     if (!selectedPoint) return { prev: null as Point | null, next: null as Point | null };
@@ -114,15 +125,6 @@
       prev: candidatePrev && candidatePrev.stream === selectedPoint.stream && candidatePrev.time < selectedPoint.time ? candidatePrev : null,
       next: candidateNext && candidateNext.stream === selectedPoint.stream && selectedPoint.time < candidateNext.time ? candidateNext : null,
     };
-  });
-
-  const pointHasChanges = $derived.by(() => {
-    if (!selectedPoint || !draft) return false;
-    return (
-      Math.abs(draft.lat - selectedPoint.lat) > 1e-9 ||
-      Math.abs(draft.lon - selectedPoint.lon) > 1e-9 ||
-      draft.time !== selectedPoint.time
-    );
   });
 
   function toggleTheme() {
@@ -253,12 +255,13 @@
     const controller = new AbortController();
     loading = true;
     routeError = '';
-    route = emptyRoute;
+    if (!detail) route = emptyRoute;
     void api<Route>('/api/route?' + query + (detail ? '&detail=1' : ''), { signal: controller.signal })
       .then((result) => {
         if (!controller.signal.aborted) {
           route = result;
-          displayedRangeKey = query + ':' + detail;
+          // Keep displayedRangeKey independent of `detail` so entering/exiting edit mode never resets zoom
+          displayedRangeKey = query;
         }
       })
       .catch((err) => { if (!controller.signal.aborted) routeError = message(err); })
@@ -292,7 +295,7 @@
     waypoints = [];
     selectedPoint = null;
     confirmDelete = false;
-    draft = null;
+    pendingEdits = {};
     editError = '';
   }
 
@@ -324,10 +327,23 @@
     }
   }
 
+  function setPointDraft(point: Point, next: Waypoint) {
+    const unchanged =
+      Math.abs(next.lat - point.lat) <= 1e-9 &&
+      Math.abs(next.lon - point.lon) <= 1e-9 &&
+      next.time === point.time;
+    const copy = { ...pendingEdits };
+    if (unchanged) {
+      delete copy[point.id];
+    } else {
+      copy[point.id] = next;
+    }
+    pendingEdits = copy;
+  }
+
   function selectCapturedPoint(point: Point) {
     if (saving) return;
     selectedPoint = point;
-    draft = { lat: point.lat, lon: point.lon, time: point.time };
     confirmDelete = false;
     editError = '';
   }
@@ -353,9 +369,11 @@
 
   function addMidpoint() {
     if (!edge || saving || waypoints.length >= 100) return;
-    const prev = waypoints.length > 0 ? waypoints[waypoints.length - 1] : edge.left;
-    const lat = (prev.lat + edge.right.lat) / 2;
-    const deltaLon = ((edge.right.lon - prev.lon + 540) % 360) - 180;
+    const leftPos = pendingEdits[edge.left.id] ?? edge.left;
+    const rightPos = pendingEdits[edge.right.id] ?? edge.right;
+    const prev = waypoints.length > 0 ? waypoints[waypoints.length - 1] : leftPos;
+    const lat = (prev.lat + rightPos.lat) / 2;
+    const deltaLon = ((rightPos.lon - prev.lon + 540) % 360) - 180;
     const lon = ((prev.lon + deltaLon / 2 + 540) % 360) - 180;
     placeWaypoint(lat, lon);
   }
@@ -368,12 +386,68 @@
   }
 
   function startInsertBetween(left: Point, right: Point) {
-    resetDrafts();
     adding = true;
     edge = { left, right };
+    waypoints = [];
+    selectedPoint = null;
+    confirmDelete = false;
+    editError = '';
   }
 
-  async function saveEdit(request: () => Promise<unknown>, notice: string) {
+  async function commitPendingWork(exitAfter: boolean) {
+    const idsToSave = Object.keys(pendingEdits).map(Number);
+    const hasWaypoints = adding && edge !== null && waypoints.length > 0;
+    if (idsToSave.length === 0 && !hasWaypoints) {
+      if (exitAfter) {
+        editRange = null;
+        resetDrafts();
+      }
+      return;
+    }
+    saving = true;
+    editError = '';
+    try {
+      const pointById = new Map(route.points.map((p) => [p.id, p]));
+      let savedPoints = 0;
+      for (const id of idsToSave) {
+        const original = pointById.get(id);
+        const edit = pendingEdits[id];
+        if (!original || !edit) continue;
+        await api('/api/points/' + id, json('PATCH', {
+          lat: edit.lat,
+          lon: edit.lon,
+          time: edit.time,
+          revision: original.revision,
+        }));
+        savedPoints++;
+      }
+      let addedCount = 0;
+      if (hasWaypoints && edge) {
+        await api('/api/points', json('POST', {
+          after: edge.left.id,
+          before: edge.right.id,
+          points: waypoints,
+        }));
+        addedCount = waypoints.length;
+      }
+      resetDrafts();
+      if (exitAfter) editRange = null;
+      if (savedPoints > 0 && addedCount > 0) {
+        feedback = `Saved ${savedPoints} edited and ${addedCount} added points.`;
+      } else if (savedPoints > 0) {
+        feedback = savedPoints === 1 ? 'Point updated.' : `Saved ${savedPoints} edited points.`;
+      } else if (addedCount > 0) {
+        feedback = addedCount === 1 ? 'Added 1 point.' : `Added ${addedCount} points.`;
+      }
+      reload++;
+    } catch (err) {
+      editError = message(err);
+    } finally {
+      saving = false;
+    }
+  }
+
+  async function saveSingleAction(request: () => Promise<unknown>, notice: string) {
     saving = true;
     editError = '';
     try {
@@ -416,30 +490,17 @@
     const idx = photos.findIndex((p) => p.id === photo.id);
     if (idx >= 0) lightboxIndex = idx;
   }
-
-  async function exportCurrentRange() {
-    exporting = true;
-    routeError = '';
-    try {
-      const filename = await downloadGPX(selected);
-      feedback = 'Exported ' + filename + '.';
-    } catch (err) {
-      routeError = message(err);
-    } finally {
-      exporting = false;
-    }
-  }
 </script>
 
 <div class="app">
   <header class="topbar">
     <a class="brand" href="/" aria-label="GPS Tracker home">
-      <img src="/icons/icon-192.png" alt="" width="34" height="34">
-      <span>GPS Tracker</span>
+      <img src={brandMark} alt="" width="34" height="34">
+      <span>GPS <b>Tracker</b></span>
     </a>
     <div class="top-actions">
       <button type="button" class="top-button icon-pill" onclick={toggleTheme} aria-label="Toggle theme" title="Toggle dark/light theme">
-        <span aria-hidden="true">{theme === 'dark' ? '☀' : '☾'}</span>
+        <Icon name={theme === 'dark' ? 'sun' : 'moon'} />
         <span class="hide-mobile">{theme === 'dark' ? 'Light' : 'Dark'}</span>
       </button>
       {#if user && !offline}
@@ -458,7 +519,7 @@
   </header>
 
   <main class="workspace" class:mobile-expanded={mobileExpanded}>
-    <aside class="sidebar" aria-label="Route controls">
+    <aside class="sidebar" class:welcome={!user || offline} aria-label="Route controls">
       <div class="mobile-sheet-bar">
         <button
           type="button"
@@ -482,7 +543,7 @@
         {#if !sessionReady}
           <p class="muted">Checking sign-in…</p>
         {:else if signInAvailable}
-          <a class="primary sign-in" href="/auth/login">Sign in with Authentik <span aria-hidden="true">↗</span></a>
+          <a class="primary sign-in" href="/auth/login">Sign in with Authentik <Icon name="external" size={15} /></a>
         {:else}
           <p class="feedback">Authentik sign-in is unavailable. Ask your server operator to check the configuration.</p>
         {/if}
@@ -497,7 +558,7 @@
           {#if view !== 'Custom'}
             <button type="button" class="square" aria-label={'Previous ' + view.toLowerCase()} disabled={editing} onclick={() => {
               if (view !== 'Custom') anchor = adjacent(view, anchor, -1);
-            }}>‹</button>
+            }}><Icon name="left" /></button>
           {/if}
           <div class="period">
             <strong>{heading(view, selected)}</strong>
@@ -506,7 +567,7 @@
           {#if view !== 'Custom'}
             <button type="button" class="square" aria-label={'Next ' + view.toLowerCase()} disabled={editing || current} onclick={() => {
               if (view !== 'Custom') anchor = adjacent(view, anchor, 1);
-            }}>›</button>
+            }}><Icon name="right" /></button>
           {/if}
         </div>
         {#if view === 'Custom' && !editing}
@@ -524,10 +585,41 @@
         {#if editing}
           <section class="panel">
             <div class="section-heading">
-              <h2>Edit route</h2>
-              <button type="button" onclick={() => { editRange = null; resetDrafts(); }} disabled={saving}>Done</button>
+              <h2><Icon name="edit" />Edit route</h2>
+              <button
+                type="button"
+                class:primary={hasUnsavedWork}
+                onclick={() => void commitPendingWork(true)}
+                disabled={saving}
+              >{saving ? 'Saving…' : 'Done'}</button>
             </div>
             <p class="muted">{heading('Custom', range)}</p>
+
+            {#if hasUnsavedWork || (adding && edge !== null)}
+              <div class="edit-top-bar">
+                <button
+                  type="button"
+                  disabled={saving}
+                  onclick={resetDrafts}
+                >Cancel</button>
+                {#if hasUnsavedWork}
+                  <button
+                    type="button"
+                    class="primary"
+                    disabled={saving}
+                    onclick={() => void commitPendingWork(false)}
+                  >
+                    {#if adding && waypoints.length > 0 && pendingEditCount === 0}
+                      Save {waypoints.length} {waypoints.length === 1 ? 'point' : 'points'}
+                    {:else if pendingEditCount > 0 && (!adding || waypoints.length === 0)}
+                      Save {pendingEditCount} {pendingEditCount === 1 ? 'point' : 'points'}
+                    {:else}
+                      Save all changes
+                    {/if}
+                  </button>
+                {/if}
+              </div>
+            {/if}
 
             <div class="mode-tabs" role="tablist" aria-label="Edit mode">
               <button
@@ -536,7 +628,7 @@
                 aria-selected={!adding}
                 class:active={!adding}
                 disabled={saving}
-                onclick={() => { resetDrafts(); adding = false; }}
+                onclick={() => { adding = false; edge = null; waypoints = []; editError = ''; }}
               >Edit points</button>
               <button
                 type="button"
@@ -544,7 +636,7 @@
                 aria-selected={adding}
                 class:active={adding}
                 disabled={loading || saving || route.points.length < 2}
-                onclick={() => { resetDrafts(); adding = true; }}
+                onclick={() => { adding = true; selectedPoint = null; confirmDelete = false; editError = ''; }}
               >Add between</button>
             </div>
 
@@ -565,7 +657,7 @@
                   <div class="waypoint-card">
                     <div class="waypoint-head">
                       <strong>New point {i + 1}</strong>
-                      <button type="button" class="mini-remove" aria-label={'Remove point ' + (i + 1)} onclick={() => removeWaypoint(i)}>×</button>
+                      <button type="button" class="mini-remove" aria-label={'Remove point ' + (i + 1)} onclick={() => removeWaypoint(i)}><Icon name="close" /></button>
                     </div>
                     <label class="waypoint-field">
                       Time
@@ -611,29 +703,15 @@
                     </div>
                   </div>
                 {/each}
-                <div class="edit-actions">
-                  <button type="button" disabled={saving} onclick={resetDrafts}>Cancel</button>
-                  {#if waypoints.length > 0}
-                    <button
-                      type="button"
-                      class="primary"
-                      disabled={saving}
-                      onclick={() => {
-                        if (edge) void saveEdit(() => api('/api/points', json('POST', {
-                          after: edge!.left.id, before: edge!.right.id, points: waypoints,
-                        })), 'Added ' + waypoints.length + (waypoints.length === 1 ? ' point.' : ' points.'));
-                      }}
-                    >Save {waypoints.length} {waypoints.length === 1 ? 'point' : 'points'}</button>
-                  {/if}
-                </div>
               {/if}
             {:else}
-              <p>Tap any captured point on the map to edit its coordinates or timestamp, drag it, insert points next to it, or delete it.</p>
-              {#if selectedPoint && draft}
+              <p>Tap any point on the map and drag it to move the point and attached route directly. Clicking Done saves all edited points.</p>
+              {#if selectedPoint && selectedDraft}
                 <div class="point-editor">
                   <div class="point-badges">
                     <span class="badge-soft">{selectedPoint.estimated ? 'Estimated' : 'Captured'}</span>
                     {#if selectedPoint.corrected}<span class="badge-connected">Edited</span>{/if}
+                    {#if selectedPoint.id in pendingEdits}<span class="badge-connected">Unsaved</span>{/if}
                   </div>
                   <div class="coord-grid">
                     <label class="waypoint-field">
@@ -643,10 +721,12 @@
                         step="0.000001"
                         min="-90"
                         max="90"
-                        value={draft.lat.toFixed(6)}
+                        value={selectedDraft.lat.toFixed(6)}
                         onchange={(event) => {
                           const val = Number(event.currentTarget.value);
-                          if (Number.isFinite(val) && val >= -90 && val <= 90 && draft) draft = { ...draft, lat: val };
+                          if (Number.isFinite(val) && val >= -90 && val <= 90 && selectedPoint && selectedDraft) {
+                            setPointDraft(selectedPoint, { ...selectedDraft, lat: val });
+                          }
                         }}
                       >
                     </label>
@@ -657,10 +737,12 @@
                         step="0.000001"
                         min="-180"
                         max="180"
-                        value={draft.lon.toFixed(6)}
+                        value={selectedDraft.lon.toFixed(6)}
                         onchange={(event) => {
                           const val = Number(event.currentTarget.value);
-                          if (Number.isFinite(val) && val >= -180 && val <= 180 && draft) draft = { ...draft, lon: val };
+                          if (Number.isFinite(val) && val >= -180 && val <= 180 && selectedPoint && selectedDraft) {
+                            setPointDraft(selectedPoint, { ...selectedDraft, lon: val });
+                          }
                         }}
                       >
                     </label>
@@ -670,51 +752,49 @@
                     <input
                       type="datetime-local"
                       step="1"
-                      value={localDateTime(draft.time)}
+                      value={localDateTime(selectedDraft.time)}
                       onchange={(event) => {
                         const val = +new Date(event.currentTarget.value);
-                        if (Number.isFinite(val) && draft) draft = { ...draft, time: val };
+                        if (Number.isFinite(val) && selectedPoint && selectedDraft) {
+                          setPointDraft(selectedPoint, { ...selectedDraft, time: val });
+                        }
                       }}
                     >
                   </label>
 
                   <div class="edit-actions">
-                    {#if pointHasChanges}
-                      <button type="button" disabled={saving} onclick={() => { if (selectedPoint) selectCapturedPoint(selectedPoint); }}>Reset</button>
+                    {#if selectedPoint.id in pendingEdits}
                       <button
                         type="button"
-                        class="primary"
                         disabled={saving}
-                        onclick={() => saveEdit(() => api('/api/points/' + selectedPoint!.id, json('PATCH', {
-                          lat: draft!.lat,
-                          lon: draft!.lon,
-                          time: draft!.time,
-                          revision: selectedPoint!.revision,
-                        })), 'Point updated.')}
-                      >Save changes</button>
+                        onclick={() => {
+                          if (selectedPoint) {
+                            setPointDraft(selectedPoint, { lat: selectedPoint.lat, lon: selectedPoint.lon, time: selectedPoint.time });
+                          }
+                        }}
+                      >Reset point</button>
+                    {/if}
+                    {#if selectedPoint.corrected}
+                      <button
+                        type="button"
+                        disabled={saving}
+                        onclick={() => saveSingleAction(() => api('/api/points/' + selectedPoint!.id, json('PATCH', {
+                          revert: true, revision: selectedPoint!.revision,
+                        })), 'Original point restored.')}
+                      >Restore original</button>
+                    {/if}
+                    {#if confirmDelete}
+                      <button type="button" disabled={saving} onclick={() => confirmDelete = false}>Cancel</button>
+                      <button
+                        type="button"
+                        class="danger"
+                        disabled={saving}
+                        onclick={() => saveSingleAction(() => api('/api/points/' + selectedPoint!.id + '?revision=' + selectedPoint!.revision, {
+                          method: 'DELETE',
+                        }), 'Point deleted.')}
+                      >Confirm delete</button>
                     {:else}
-                      {#if selectedPoint.corrected}
-                        <button
-                          type="button"
-                          disabled={saving}
-                          onclick={() => saveEdit(() => api('/api/points/' + selectedPoint!.id, json('PATCH', {
-                            revert: true, revision: selectedPoint!.revision,
-                          })), 'Original point restored.')}
-                        >Restore original</button>
-                      {/if}
-                      {#if confirmDelete}
-                        <button type="button" disabled={saving} onclick={() => confirmDelete = false}>Cancel</button>
-                        <button
-                          type="button"
-                          class="danger"
-                          disabled={saving}
-                          onclick={() => saveEdit(() => api('/api/points/' + selectedPoint!.id + '?revision=' + selectedPoint!.revision, {
-                            method: 'DELETE',
-                          }), 'Point deleted.')}
-                        >Confirm delete</button>
-                      {:else}
-                        <button type="button" class="danger" disabled={saving} onclick={() => confirmDelete = true}>Delete point</button>
-                      {/if}
+                      <button type="button" class="danger" disabled={saving} onclick={() => confirmDelete = true}>Delete point</button>
                     {/if}
                   </div>
 
@@ -738,13 +818,8 @@
         {:else}
           <section class="panel">
             <div class="section-heading">
-              <h2>Route summary</h2>
-              <div class="edit-actions">
-                <button type="button" disabled={loading || exporting || route.count === 0} onclick={() => void exportCurrentRange()}>
-                  {exporting ? 'Exporting…' : 'Export GPX'}
-                </button>
-                <button type="button" disabled={loading || route.count === 0} onclick={beginEdit}>Edit route</button>
-              </div>
+              <h2><Icon name="route" />Route summary</h2>
+              <button type="button" disabled={loading || route.count === 0} onclick={beginEdit}><Icon name="edit" size={14} />Edit route</button>
             </div>
             {#if loading}
               <p class="muted" role="status">Loading route…</p>
@@ -759,8 +834,8 @@
             {/if}
           </section>
 
-          <section class="panel layers">
-            <h2>Map layers</h2>
+          <section class="panel layers" style:--route-line={routeColors.route} style:--gap-line={routeColors.gap}>
+            <h2><Icon name="layers" />Map layers</h2>
             <div class="layer-pills" role="radiogroup" aria-label="Base map layer">
               {#each mapLayers as option (option.id)}
                 <button
@@ -796,7 +871,7 @@
           {#if immich?.connected && showPhotos && photos.length > 0}
             <section class="panel">
               <div class="section-heading">
-                <h2>Immich photos ({photos.length})</h2>
+                <h2><Icon name="photo" />Immich photos ({photos.length})</h2>
                 <small class="muted">Tap for preview</small>
               </div>
               <div class="photo-strip">
@@ -821,18 +896,20 @@
 
           <section class="panel">
             <div class="section-heading">
-              <button
-                type="button"
-                class="plain collapse-heading"
-                aria-expanded={recentOpen}
-                onclick={() => { recentOpen = !recentOpen; if (recentOpen) void loadRecentUploads(); }}
-              >
-                <h2>Recent points (last 10)</h2>
-                <span aria-hidden="true">{recentOpen ? '▴' : '▾'}</span>
-              </button>
+              <h2 class="recent-heading">
+                <button
+                  type="button"
+                  class="plain collapse-heading"
+                  aria-expanded={recentOpen}
+                  onclick={() => { recentOpen = !recentOpen; if (recentOpen) void loadRecentUploads(); }}
+                >
+                  <span class="section-title"><Icon name="history" />Recent points <small>(last 10)</small></span>
+                  <Icon name={recentOpen ? 'up' : 'down'} size={15} />
+                </button>
+              </h2>
               {#if recentOpen}
-                <button type="button" disabled={recentLoading} onclick={() => void loadRecentUploads()}>
-                  {recentLoading ? '…' : '↻'}
+                <button type="button" disabled={recentLoading} aria-label="Refresh recent points" onclick={() => void loadRecentUploads()}>
+                  <Icon name="refresh" size={15} />
                 </button>
               {/if}
             </div>
@@ -865,21 +942,22 @@
         photos={offline || !user ? [] : photos}
         fitKey={displayedRangeKey}
         {mapLayer}
+        {routeColors}
         {showRoute}
         {showGaps}
         {focusPoint}
         editing={editing && !offline}
         {adding}
         {edge}
-        {draft}
+        {pendingEdits}
         {selectedPoint}
         {waypoints}
         onSelect={selectCapturedPoint}
         onMove={(point, lat, lon) => {
           if (!saving) {
-            const same = selectedPoint?.id === point.id;
             selectedPoint = point;
-            draft = { lat, lon, time: same && draft ? draft.time : point.time };
+            const existing = pendingEdits[point.id];
+            setPointDraft(point, { lat, lon, time: existing ? existing.time : point.time });
           }
         }}
         onEdge={(value) => edge = value}
@@ -900,14 +978,12 @@
   <ProfilePage
     {user}
     {immich}
-    {theme}
     selectedRange={selected}
     {recentUploads}
     {recentLoading}
     onClose={() => profileOpen = false}
     onImmich={(value) => immich = value}
     onImported={imported}
-    onToggleTheme={toggleTheme}
     onRefreshRecent={() => void loadRecentUploads()}
     onJumpToUpload={jumpToUpload}
     onLogout={() => {
