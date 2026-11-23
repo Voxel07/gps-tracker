@@ -11,7 +11,6 @@
     applyTheme,
     calendarRange,
     emptyRoute,
-    formatCoords,
     formatDistance,
     getInitialMapLayer,
     getInitialTheme,
@@ -19,11 +18,11 @@
     json,
     localDateTime,
     localDay,
-    mapLayers,
     mapRouteColors,
     message,
     onSessionUpdate,
     rangeQuery,
+    redirectToSignIn,
     refreshSession,
     saveMapLayer,
     when,
@@ -52,15 +51,10 @@
   let theme = $state<Theme>(initialTheme);
   let mapLayer = $state<MapLayerId>(getInitialMapLayer());
   const routeColors = $derived(mapRouteColors(mapLayer, theme));
-  let showRoute = $state(true);
-  let showGaps = $state(true);
-  let showPhotos = $state(true);
-  let mobileExpanded = $state(false);
 
   let user = $state<{ name: string } | null>(null);
   let sessionExpiresAt = $state<number | null>(null);
   let sessionReady = $state(false);
-  let signInAvailable = $state(false);
   let offline = $state(false);
 
   let view = $state<View>('Day');
@@ -79,7 +73,6 @@
   let immich = $state<Immich | null>(null);
   let recentUploads = $state<RecentUpload[]>([]);
   let recentLoading = $state(false);
-  let recentOpen = $state(false);
   let profileOpen = $state(false);
   let focusPoint = $state<{ lat: number; lon: number; seq: number } | null>(null);
   let focusSeq = 0;
@@ -157,6 +150,7 @@
         immich = null;
         recentUploads = [];
         profileOpen = false;
+        if (navigator.onLine) redirectToSignIn();
       }
     });
 
@@ -173,9 +167,6 @@
       }
     };
     offline = !navigator.onLine;
-    if (new URL(location.href).searchParams.get('signin') === 'failed') {
-      signinError = 'Sign-in was interrupted. Try again.';
-    }
     if (!offline) void loadSession();
     else sessionReady = true;
 
@@ -203,7 +194,6 @@
     try {
       const state = await api<SessionInfo>('/api/session');
       offline = false;
-      signInAvailable = state.signInAvailable;
       if (state.user) {
         user = state.user;
         sessionExpiresAt = state.expiresAt;
@@ -219,6 +209,12 @@
       } else {
         user = null;
         sessionExpiresAt = null;
+      }
+      if (!user) {
+        // The server only serves this page to signed-in users. Landing here
+        // without a session means it ended, so go straight back to Authentik.
+        redirectToSignIn();
+        return;
       }
       if (user) {
         const [immichState] = await Promise.all([
@@ -271,7 +267,7 @@
 
   $effect(() => {
     const query = rangeKey;
-    const active = !!user && !!immich?.connected && showPhotos && !offline && !editing && route.count > 0;
+    const active = !!user && !!immich?.connected && !offline && !editing && route.count > 0;
     photos = [];
     photoError = '';
     photoPartial = false;
@@ -483,7 +479,6 @@
     anchor = new Date(item.recordedAt);
     feedback = 'Viewing ' + item.deviceName + ' fix from ' + whenShort(item.recordedAt) + '.';
     focusOn(item.lat, item.lon);
-    mobileExpanded = false;
   }
 
   function openPhotoLightbox(photo: Photo) {
@@ -518,20 +513,8 @@
     </div>
   </header>
 
-  <main class="workspace" class:mobile-expanded={mobileExpanded}>
+  <main class="workspace">
     <aside class="sidebar" class:welcome={!user || offline} aria-label="Route controls">
-      <div class="mobile-sheet-bar">
-        <button
-          type="button"
-          class="sheet-toggle"
-          onclick={() => mobileExpanded = !mobileExpanded}
-          aria-expanded={mobileExpanded}
-        >
-          <span class="sheet-pill" aria-hidden="true"></span>
-          <span>{mobileExpanded ? 'Show more map' : 'Expand panel'}</span>
-        </button>
-      </div>
-
       {#if offline}
         <h1>You’re offline</h1>
         <p class="muted">Reconnect to view your routes and photos. GPSLogger can keep recording while your phone is offline.</p>
@@ -539,13 +522,14 @@
       {:else if !user}
         <h1>Movement history</h1>
         <p class="muted">View your GPSLogger routes, edit points, fill gaps, and browse Immich photos from places you visited.</p>
-        {#if signinError}<p class="feedback error" role="alert">{signinError}</p>{/if}
-        {#if !sessionReady}
+        {#if signinError}
+          <p class="feedback error" role="alert">{signinError}</p>
+          <button class="primary sign-in" onclick={loadSession}>Try again</button>
+        {:else if !sessionReady}
           <p class="muted">Checking sign-in…</p>
-        {:else if signInAvailable}
-          <a class="primary sign-in" href="/auth/login">Sign in with Authentik <Icon name="external" size={15} /></a>
         {:else}
-          <p class="feedback">Authentik sign-in is unavailable. Ask your server operator to check the configuration.</p>
+          <p class="muted">Redirecting to Authentik…</p>
+          <a class="primary sign-in" href="/auth/login">Sign in with Authentik <Icon name="external" size={15} /></a>
         {/if}
       {:else}
         <h1>Movement history</h1>
@@ -834,46 +818,14 @@
             {/if}
           </section>
 
-          <section class="panel layers" style:--route-line={routeColors.route} style:--gap-line={routeColors.gap}>
-            <h2><Icon name="layers" />Map layers</h2>
-            <div class="layer-pills" role="radiogroup" aria-label="Base map layer">
-              {#each mapLayers as option (option.id)}
-                <button
-                  type="button"
-                  role="radio"
-                  aria-checked={mapLayer === option.id}
-                  class:active={mapLayer === option.id}
-                  onclick={() => changeLayer(option.id)}
-                >{option.shortLabel}</button>
-              {/each}
-            </div>
-            <label class="legend-row">
-              <span class="swatch" aria-hidden="true"></span>
-              Recorded route
-              <input type="checkbox" bind:checked={showRoute}>
-            </label>
-            <label class="legend-row">
-              <span class="swatch dashed" aria-hidden="true"></span>
-              Recording gaps
-              <input type="checkbox" bind:checked={showGaps}>
-            </label>
-            {#if immich?.connected}
-              <label class="legend-row">
-                <span class="photo-swatch" aria-hidden="true"></span>
-                Immich photos
-                <input type="checkbox" bind:checked={showPhotos}>
-              </label>
-              {#if photoError}<p class="feedback error">{photoError}</p>{/if}
-              {#if photoPartial}<p class="muted">Choose a shorter range to see more photos.</p>{/if}
-            {/if}
-          </section>
-
-          {#if immich?.connected && showPhotos && photos.length > 0}
+          {#if immich?.connected && (photos.length > 0 || photoError)}
             <section class="panel">
               <div class="section-heading">
                 <h2><Icon name="photo" />Immich photos ({photos.length})</h2>
                 <small class="muted">Tap for preview</small>
               </div>
+              {#if photoError}<p class="feedback error">{photoError}</p>{/if}
+              {#if photoPartial}<p class="muted">Choose a shorter range to see more photos.</p>{/if}
               <div class="photo-strip">
                 {#each photos as photo, idx (photo.id)}
                   <button
@@ -893,45 +845,6 @@
               </div>
             </section>
           {/if}
-
-          <section class="panel">
-            <div class="section-heading">
-              <h2 class="recent-heading">
-                <button
-                  type="button"
-                  class="plain collapse-heading"
-                  aria-expanded={recentOpen}
-                  onclick={() => { recentOpen = !recentOpen; if (recentOpen) void loadRecentUploads(); }}
-                >
-                  <span class="section-title"><Icon name="history" />Recent points <small>(last 10)</small></span>
-                  <Icon name={recentOpen ? 'up' : 'down'} size={15} />
-                </button>
-              </h2>
-              {#if recentOpen}
-                <button type="button" disabled={recentLoading} aria-label="Refresh recent points" onclick={() => void loadRecentUploads()}>
-                  <Icon name="refresh" size={15} />
-                </button>
-              {/if}
-            </div>
-            {#if recentOpen}
-              {#if recentUploads.length === 0}
-                <p class="muted">No points sent from GPSLogger yet.</p>
-              {:else}
-                <div class="recent-compact-list">
-                  {#each recentUploads as item (item.id)}
-                    <button type="button" class="recent-compact-item" onclick={() => jumpToUpload(item)}>
-                      <div class="recent-top">
-                        <strong>{item.deviceName}</strong>
-                        <span class:dup={item.duplicate} class="status-pill">{item.duplicate ? 'Dup' : 'Saved'}</span>
-                      </div>
-                      <small class="mono">{formatCoords(item.lat, item.lon)}</small>
-                      <small class="muted">{whenShort(item.recordedAt)}</small>
-                    </button>
-                  {/each}
-                </div>
-              {/if}
-            {/if}
-          </section>
         {/if}
       {/if}
     </aside>
@@ -943,8 +856,6 @@
         fitKey={displayedRangeKey}
         {mapLayer}
         {routeColors}
-        {showRoute}
-        {showGaps}
         {focusPoint}
         editing={editing && !offline}
         {adding}
@@ -994,6 +905,7 @@
       immich = null;
       recentUploads = [];
       profileOpen = false;
+      location.replace('/auth/signed-out');
     }}
   />
 {/if}

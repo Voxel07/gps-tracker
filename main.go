@@ -156,7 +156,7 @@ func run() error {
 		a.oidc = provider.VerifierContext(oidc.ClientContext(context.Background(), client), &oidc.Config{ClientID: clientID})
 		a.oauth = oauth2.Config{ClientID: clientID, ClientSecret: clientSecret, RedirectURL: origin + "/auth/callback", Endpoint: provider.Endpoint(), Scopes: []string{oidc.ScopeOpenID, "profile"}}
 	} else {
-		log.Print("Authentik is unconfigured. Browser sign-in is unavailable.")
+		log.Print("Authentik is unconfigured. The web app stays locked until OIDC is configured.")
 	}
 	server := &http.Server{
 		Addr: env("LISTEN_ADDR", ":8080"), Handler: a.routes(), ReadHeaderTimeout: 5 * time.Second,
@@ -211,6 +211,7 @@ func (a *app) routes() http.Handler {
 	mux.HandleFunc("GET /auth/callback", a.callback)
 	mux.HandleFunc("POST /auth/refresh", a.refresh)
 	mux.HandleFunc("POST /auth/logout", a.logout)
+	mux.HandleFunc("GET /auth/signed-out", a.signedOut)
 	mux.HandleFunc("POST /api/upload", a.upload)
 	mux.HandleFunc("GET /api/session", a.sessionStatus)
 	mux.HandleFunc("GET /api/keys", a.signedIn(a.listKeys))
@@ -228,7 +229,7 @@ func (a *app) routes() http.Handler {
 	mux.HandleFunc("DELETE /api/immich", a.signedIn(a.deleteImmich))
 	mux.HandleFunc("GET /api/photos", a.signedIn(a.photos))
 	mux.HandleFunc("GET /api/photos/{id}/thumbnail", a.signedIn(a.thumbnail))
-	mux.HandleFunc("GET /", serveWeb)
+	mux.HandleFunc("GET /", a.requireSignIn(serveWeb))
 	return gzipMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")

@@ -4,9 +4,12 @@ import (
 	"context"
 	"crypto/subtle"
 	"database/sql"
+	"encoding/base64"
 	"errors"
+	"html/template"
 	"log"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -78,30 +81,59 @@ func (a *app) cookieValue(r *http.Request, name string) string {
 	return cookie.Value
 }
 
+// safeNext limits post-login redirects to local paths of the tracker itself.
+func safeNext(value string) string {
+	if value == "" || len(value) > 1024 || !strings.HasPrefix(value, "/") || strings.HasPrefix(value, "//") ||
+		strings.HasPrefix(value, "/auth/") || strings.ContainsAny(value, "\\\r\n\t") {
+		return "/"
+	}
+	return value
+}
+
 func (a *app) login(w http.ResponseWriter, r *http.Request) {
 	if a.oidc == nil {
-		problem(w, http.StatusServiceUnavailable, "Authentik sign-in is not configured")
+		signInUnavailable(w)
 		return
 	}
 	state, nonce, verifier := newToken(), newToken(), oauth2.GenerateVerifier()
-	a.cookie(w, "gps_login", state+"."+nonce+"."+verifier, 600)
+	next := base64.RawURLEncoding.EncodeToString([]byte(safeNext(r.URL.Query().Get("next"))))
+	a.cookie(w, "gps_login", state+"."+nonce+"."+verifier+"."+next, 600)
 	http.Redirect(w, r, a.oauth.AuthCodeURL(state, oidc.Nonce(nonce), oauth2.S256ChallengeOption(verifier)), http.StatusFound)
+}
+
+func (a *app) signInFailed(w http.ResponseWriter) {
+	authPage(w, http.StatusBadRequest, "Sign-in failed",
+		"Authentik did not complete the sign-in. Your account may not have access to GPS Tracker, or the sign-in took too long.",
+		"/auth/login", "Try again")
+}
+
+func (a *app) signedOut(w http.ResponseWriter, r *http.Request) {
+	authPage(w, http.StatusOK, "Signed out", "You have signed out of GPS Tracker.", "/auth/login", "Sign in again")
+}
+
+func signInUnavailable(w http.ResponseWriter) {
+	authPage(w, http.StatusServiceUnavailable, "Sign-in unavailable",
+		"Authentik sign-in is not configured. Ask your server operator to set OIDC_ISSUER, OIDC_CLIENT_ID and OIDC_CLIENT_SECRET.", "", "")
 }
 
 func (a *app) callback(w http.ResponseWriter, r *http.Request) {
 	flow := strings.Split(a.cookieValue(r, "gps_login"), ".")
 	a.cookie(w, "gps_login", "", -1)
 	code := r.URL.Query().Get("code")
-	if a.oidc == nil || len(flow) != 3 || code == "" || subtle.ConstantTimeCompare([]byte(flow[0]), []byte(r.URL.Query().Get("state"))) != 1 {
+	if a.oidc == nil || len(flow) != 4 || code == "" || subtle.ConstantTimeCompare([]byte(flow[0]), []byte(r.URL.Query().Get("state"))) != 1 {
 		log.Print("OIDC callback rejected: missing login cookie, authorization code, or state mismatch")
-		http.Redirect(w, r, "/?signin=failed", http.StatusSeeOther)
+		a.signInFailed(w)
 		return
+	}
+	next := "/"
+	if decoded, err := base64.RawURLEncoding.DecodeString(flow[3]); err == nil {
+		next = safeNext(string(decoded))
 	}
 	ctx := oidc.ClientContext(r.Context(), a.httpClient)
 	token, err := a.oauth.Exchange(ctx, code, oauth2.VerifierOption(flow[2]))
 	if err != nil {
 		log.Printf("OIDC token exchange failed: %v", err)
-		http.Redirect(w, r, "/?signin=failed", http.StatusSeeOther)
+		a.signInFailed(w)
 		return
 	}
 	raw, _ := token.Extra("id_token").(string)
@@ -112,7 +144,7 @@ func (a *app) callback(w http.ResponseWriter, r *http.Request) {
 		} else {
 			log.Print("OIDC ID token rejected: missing subject or nonce mismatch")
 		}
-		http.Redirect(w, r, "/?signin=failed", http.StatusSeeOther)
+		a.signInFailed(w)
 		return
 	}
 	var claims struct {
@@ -138,7 +170,7 @@ func (a *app) callback(w http.ResponseWriter, r *http.Request) {
 		serverError(w, err)
 		return
 	}
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	http.Redirect(w, r, next, http.StatusSeeOther)
 }
 
 func (a *app) lookupSession(r *http.Request) (account, int64, error) {
@@ -186,27 +218,30 @@ func (a *app) sessionStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (a *app) refresh(w http.ResponseWriter, r *http.Request) {
-	if r.Header.Get("Origin") != a.origin {
-		problem(w, http.StatusForbidden, "Request must come from the tracker")
-		return
-	}
-	rawRefresh := a.cookieValue(r, "gps_refresh")
+// refreshReuseGrace tolerates a second use of a refresh token shortly after it
+// was rotated, for example when several tabs reopen at the same time. Such a
+// request is rejected but does not revoke the token family.
+const refreshReuseGrace = 30
+
+func (a *app) clearSessionCookies(w http.ResponseWriter) {
+	a.cookie(w, "gps_session", "", -1)
+	a.cookie(w, "gps_refresh", "", -1)
+}
+
+// rotateRefresh exchanges a refresh token for a new session and refresh token
+// and sets both cookies. A non-empty reason means the caller must sign in again.
+func (a *app) rotateRefresh(ctx context.Context, w http.ResponseWriter, rawRefresh string) (user account, expiresAt int64, reason string, err error) {
 	if rawRefresh == "" {
-		a.cookie(w, "gps_session", "", -1)
-		a.cookie(w, "gps_refresh", "", -1)
-		problem(w, http.StatusUnauthorized, "Sign in to continue")
-		return
+		a.clearSessionCookies(w)
+		return user, 0, "Sign in to continue", nil
 	}
-	ctx := r.Context()
 	now := time.Now()
 	nowUnix := now.Unix()
 	refreshHash := tokenHash(rawRefresh)
 
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
-		serverError(w, err)
-		return
+		return user, 0, "", err
 	}
 	defer tx.Rollback()
 
@@ -217,51 +252,44 @@ func (a *app) refresh(w http.ResponseWriter, r *http.Request) {
 		"SELECT family_id, user_id, session_hash, expires, revoked FROM refresh_tokens WHERE hash = ?",
 		refreshHash).Scan(&familyID, &userID, &oldSessionHash, &expires, &revoked)
 	if errors.Is(err, sql.ErrNoRows) {
-		a.cookie(w, "gps_session", "", -1)
-		a.cookie(w, "gps_refresh", "", -1)
-		problem(w, http.StatusUnauthorized, "Sign in to continue")
-		return
+		a.clearSessionCookies(w)
+		return user, 0, "Sign in to continue", nil
 	}
 	if err != nil {
-		serverError(w, err)
-		return
+		return user, 0, "", err
 	}
 
 	if revoked.Valid {
+		if nowUnix-revoked.Int64 <= refreshReuseGrace {
+			// A concurrent request already rotated this token. Leave the cookies
+			// alone so the newer tokens set by that request survive.
+			return user, 0, "Sign in to continue", nil
+		}
 		// Refresh token reuse detected: revoke the entire token family.
 		_, _ = tx.ExecContext(ctx, "DELETE FROM sessions WHERE hash IN (SELECT session_hash FROM refresh_tokens WHERE family_id = ? AND session_hash IS NOT NULL)", familyID)
 		_, _ = tx.ExecContext(ctx, "DELETE FROM refresh_tokens WHERE family_id = ?", familyID)
 		_ = tx.Commit()
-		a.cookie(w, "gps_session", "", -1)
-		a.cookie(w, "gps_refresh", "", -1)
-		problem(w, http.StatusUnauthorized, "Session revoked. Sign in again.")
-		return
+		a.clearSessionCookies(w)
+		return user, 0, "Session revoked. Sign in again.", nil
 	}
 
 	if expires <= nowUnix {
 		_, _ = tx.ExecContext(ctx, "DELETE FROM refresh_tokens WHERE hash = ?", refreshHash)
 		_ = tx.Commit()
-		a.cookie(w, "gps_session", "", -1)
-		a.cookie(w, "gps_refresh", "", -1)
-		problem(w, http.StatusUnauthorized, "Session expired. Sign in again.")
-		return
+		a.clearSessionCookies(w)
+		return user, 0, "Session expired. Sign in again.", nil
 	}
 
-	var user account
 	if err := tx.QueryRowContext(ctx, "SELECT id, name FROM users WHERE id = ?", userID).Scan(&user.ID, &user.Name); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			a.cookie(w, "gps_session", "", -1)
-			a.cookie(w, "gps_refresh", "", -1)
-			problem(w, http.StatusUnauthorized, "Sign in to continue")
-			return
+			a.clearSessionCookies(w)
+			return user, 0, "Sign in to continue", nil
 		}
-		serverError(w, err)
-		return
+		return user, 0, "", err
 	}
 
 	if _, err := tx.ExecContext(ctx, "UPDATE refresh_tokens SET revoked = ? WHERE hash = ?", nowUnix, refreshHash); err != nil {
-		serverError(w, err)
-		return
+		return user, 0, "", err
 	}
 	if len(oldSessionHash) > 0 {
 		_, _ = tx.ExecContext(ctx, "DELETE FROM sessions WHERE hash = ?", oldSessionHash)
@@ -270,29 +298,138 @@ func (a *app) refresh(w http.ResponseWriter, r *http.Request) {
 	newSession := newToken()
 	newRefresh := newToken()
 	newSessionHash := tokenHash(newSession)
-	newRefreshHash := tokenHash(newRefresh)
 	sessionExpires := now.Add(sessionTokenAge).Unix()
 	refreshExpires := now.Add(refreshTokenAge).Unix()
 
 	if _, err := tx.ExecContext(ctx, "INSERT INTO sessions (hash, user_id, expires) VALUES (?, ?, ?)", newSessionHash, userID, sessionExpires); err != nil {
-		serverError(w, err)
-		return
+		return user, 0, "", err
 	}
 	if _, err := tx.ExecContext(ctx, "INSERT INTO refresh_tokens (hash, family_id, user_id, session_hash, expires) VALUES (?, ?, ?, ?, ?)",
-		newRefreshHash, familyID, userID, newSessionHash, refreshExpires); err != nil {
-		serverError(w, err)
-		return
+		tokenHash(newRefresh), familyID, userID, newSessionHash, refreshExpires); err != nil {
+		return user, 0, "", err
 	}
 	_, _ = tx.ExecContext(ctx, "DELETE FROM sessions WHERE expires <= ?", nowUnix)
 	_, _ = tx.ExecContext(ctx, "DELETE FROM refresh_tokens WHERE expires <= ?", nowUnix)
 
 	if err := tx.Commit(); err != nil {
-		serverError(w, err)
-		return
+		return user, 0, "", err
 	}
 	a.cookie(w, "gps_session", newSession, int(sessionTokenAge.Seconds()))
 	a.cookie(w, "gps_refresh", newRefresh, int(refreshTokenAge.Seconds()))
-	jsonResponse(w, http.StatusOK, map[string]any{"user": user, "expiresAt": sessionExpires * 1000})
+	return user, sessionExpires * 1000, "", nil
+}
+
+func (a *app) refresh(w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get("Origin") != a.origin {
+		problem(w, http.StatusForbidden, "Request must come from the tracker")
+		return
+	}
+	user, expiresAt, reason, err := a.rotateRefresh(r.Context(), w, a.cookieValue(r, "gps_refresh"))
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	if reason != "" {
+		problem(w, http.StatusUnauthorized, reason)
+		return
+	}
+	jsonResponse(w, http.StatusOK, map[string]any{"user": user, "expiresAt": expiresAt})
+}
+
+// isNavigation reports whether a browser is loading a page, as opposed to a
+// script, stylesheet or fetch request.
+func isNavigation(r *http.Request) bool {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		return false
+	}
+	if mode := r.Header.Get("Sec-Fetch-Mode"); mode != "" {
+		return mode == "navigate"
+	}
+	return strings.Contains(r.Header.Get("Accept"), "text/html")
+}
+
+// requireSignIn protects the web app itself. The manifest and icons stay public
+// because browsers fetch them without cookies when installing the app.
+func (a *app) requireSignIn(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/manifest.webmanifest" || strings.HasPrefix(r.URL.Path, "/icons/") {
+			next(w, r)
+			return
+		}
+		if a.oidc == nil {
+			signInUnavailable(w)
+			return
+		}
+		_, _, err := a.lookupSession(r)
+		if err == nil {
+			next(w, r)
+			return
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			serverError(w, err)
+			return
+		}
+		navigation := isNavigation(r)
+		if refresh := a.cookieValue(r, "gps_refresh"); navigation && refresh != "" {
+			_, _, reason, err := a.rotateRefresh(r.Context(), w, refresh)
+			if err != nil {
+				serverError(w, err)
+				return
+			}
+			if reason == "" {
+				next(w, r)
+				return
+			}
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		if navigation {
+			http.Redirect(w, r, "/auth/login?next="+url.QueryEscape(safeNext(r.URL.RequestURI())), http.StatusFound)
+			return
+		}
+		problem(w, http.StatusUnauthorized, "Sign in to continue")
+	}
+}
+
+var authPageTemplate = template.Must(template.New("auth").Parse(`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<link rel="icon" href="/icons/icon-192.png">
+<title>{{.Title}} · GPS Tracker</title>
+<style>
+:root { --bg: #f6f1e7; --panel: #ffffff; --text: #060517; --muted: #4b4a5c; --accent: #cf5c36; --on-accent: #ffffff; }
+@media (prefers-color-scheme: dark) { :root { --bg: #060517; --panel: #12112a; --text: #f4ecdd; --muted: #b9b3c9; --accent: #efc88b; --on-accent: #060517; } }
+* { box-sizing: border-box; }
+body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 16px; background: var(--bg); color: var(--text); font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { width: 100%; max-width: 420px; padding: 32px 28px; border-radius: 16px; background: var(--panel); box-shadow: 0 12px 40px rgb(0 0 0 / 0.18); }
+.brand { display: flex; align-items: center; gap: 10px; margin-bottom: 24px; font-weight: 600; }
+.brand img { width: 32px; height: 32px; border-radius: 8px; }
+h1 { margin: 0 0 8px; font-size: 1.4rem; }
+p { margin: 0 0 24px; color: var(--muted); }
+a.button { display: inline-block; padding: 10px 18px; border-radius: 10px; background: var(--accent); color: var(--on-accent); font-weight: 600; text-decoration: none; }
+a.button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
+</style>
+</head>
+<body>
+<main>
+<div class="brand"><img src="/icons/icon-192.png" alt="">GPS Tracker</div>
+<h1>{{.Title}}</h1>
+<p>{{.Message}}</p>
+{{if .Link}}<a class="button" href="{{.Link}}">{{.LinkText}}</a>{{end}}
+</main>
+</body>
+</html>
+`))
+
+func authPage(w http.ResponseWriter, status int, title, message, link, linkText string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	if err := authPageTemplate.Execute(w, map[string]string{"Title": title, "Message": message, "Link": link, "LinkText": linkText}); err != nil {
+		log.Printf("write auth page: %v", err)
+	}
 }
 
 func (a *app) signedIn(handler func(http.ResponseWriter, *http.Request, account)) http.HandlerFunc {

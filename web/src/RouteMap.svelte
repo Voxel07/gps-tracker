@@ -11,8 +11,6 @@
     fitKey: string;
     mapLayer: MapLayerId;
     routeColors: { route: string; gap: string };
-    showRoute: boolean;
-    showGaps: boolean;
     focusPoint: { lat: number; lon: number; seq: number } | null;
     editing: boolean;
     adding: boolean;
@@ -35,8 +33,6 @@
     fitKey,
     mapLayer,
     routeColors,
-    showRoute,
-    showGaps,
     focusPoint,
     editing,
     adding,
@@ -64,6 +60,25 @@
   let lastFocusSeq = 0;
   let layerMenuOpen = $state(false);
   let liveDrag = $state<{ id: number; lat: number; lon: number } | null>(null);
+  let wrapper: HTMLDivElement;
+  let fullscreen = $state(false);
+
+  // Uses the browser's Fullscreen API where available (hides the browser UI) and
+  // falls back to a fixed full-viewport layout, e.g. on iPhone Safari.
+  async function setFullscreen(next: boolean) {
+    if (next === fullscreen) return;
+    fullscreen = next;
+    layerMenuOpen = false;
+    try {
+      if (next && wrapper.requestFullscreen && !document.fullscreenElement) {
+        await wrapper.requestFullscreen({ navigationUI: 'hide' });
+      } else if (!next && document.fullscreenElement) {
+        await document.exitFullscreen();
+      }
+    } catch {
+      // The CSS fallback still covers the viewport.
+    }
+  }
 
   const activeLayerOption = $derived(mapLayers.find((l) => l.id === mapLayer) ?? mapLayers[0]);
 
@@ -96,8 +111,19 @@
     });
     const resize = new ResizeObserver(() => instance.invalidateSize({ pan: false }));
     resize.observe(node);
+    const onFullscreenChange = () => {
+      if (!document.fullscreenElement && fullscreen) fullscreen = false;
+    };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && fullscreen && !document.fullscreenElement) void setFullscreen(false);
+    };
+    document.addEventListener('fullscreenchange', onFullscreenChange);
+    document.addEventListener('keydown', onKey);
     map = instance;
     return () => {
+      document.removeEventListener('fullscreenchange', onFullscreenChange);
+      document.removeEventListener('keydown', onKey);
+      if (document.fullscreenElement === wrapper) void document.exitFullscreen().catch(() => {});
       resize.disconnect();
       instance.remove();
     };
@@ -146,16 +172,16 @@
       const pointPos = resolvedCoords(point);
       const prevPos = previous ? resolvedCoords(previous) : null;
       if (previous && prevPos && (previous.stream !== point.stream || point.breakBefore || Math.abs(pointPos.lon - prevPos.lon) > 180)) {
-        if (showRoute) line(run, routeColor);
+        line(run, routeColor);
         run = [];
-        if (showGaps && point.breakBefore && previous.stream === point.stream && Math.abs(pointPos.lon - prevPos.lon) <= 180) {
+        if (point.breakBefore && previous.stream === point.stream && Math.abs(pointPos.lon - prevPos.lon) <= 180) {
           line([loc(prevPos), loc(pointPos)], gapColor, true);
         }
       }
       run.push(loc(pointPos));
     }
-    if (showRoute) line(run, routeColor);
-    if (route.latest && !editing && showRoute) {
+    line(run, routeColor);
+    if (route.latest && !editing) {
       const label = document.createElement('span');
       label.textContent = (route.latest.estimated ? 'Estimated point · ' : 'Latest point · ') + when(route.latest.time);
       L.marker(loc(route.latest), { icon: dot('latest', 20), title: label.textContent, zIndexOffset: 300 })
@@ -197,7 +223,11 @@
         hint.className = 'photo-popup-hint';
         hint.textContent = 'Tap to enlarge';
         button.append(image, hint);
-        button.addEventListener('click', () => onPhotoOpen(photo));
+        button.addEventListener('click', () => {
+          // The lightbox lives outside the map, so leave fullscreen to show it.
+          void setFullscreen(false);
+          onPhotoOpen(photo);
+        });
         body.append(button, caption);
       });
     }
@@ -323,8 +353,19 @@
   });
 </script>
 
-<div class="map-wrapper" data-layer={mapLayer}>
+<div class="map-wrapper" class:fullscreen data-layer={mapLayer} bind:this={wrapper}>
   <div class="leaflet-host" class:placing={editing && adding && edge !== null} bind:this={node} aria-label="GPS route map"></div>
+
+  <button
+    type="button"
+    class="map-fullscreen"
+    aria-pressed={fullscreen}
+    aria-label={fullscreen ? 'Exit full screen map' : 'Show map full screen'}
+    title={fullscreen ? 'Exit full screen (Esc)' : 'Full screen'}
+    onclick={() => void setFullscreen(!fullscreen)}
+  >
+    <Icon name={fullscreen ? 'shrink' : 'expand'} />
+  </button>
 
   <div class="map-layer-control">
     <button

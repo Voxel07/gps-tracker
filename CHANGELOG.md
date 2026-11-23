@@ -5,6 +5,29 @@ All notable changes to GPS Tracker are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.5] - 2026-11-23
+
+### Security
+- **Whole app behind Authentik**: The server now refuses to serve the web app (HTML, scripts, styles, service worker) without a valid session. Signed-out page loads redirect straight to Authentik and return to the requested page after sign-in. Only `/api/upload` (device keys), `/healthz`, `/auth/*`, the manifest, and the app icons remain public.
+- **Server-side session renewal on page load**: An expired session is renewed from the refresh token when a page loads, so returning users don't have to sign in again.
+- **Fail closed without OIDC**: When Authentik is not configured, the app shows a configuration notice instead of the UI.
+- **Private asset caching**: Hashed assets now use `Cache-Control: private` so shared proxies don't serve them to signed-out visitors.
+- **Refresh reuse grace window**: A refresh token reused within 30 seconds of rotation (e.g. several tabs reopening at once) is rejected without revoking the whole token family.
+
+### Added
+- **Full-screen map**: A button above the zoom controls expands the map to fill the screen, using the browser's Fullscreen API where available and a full-viewport layout otherwise (e.g. iPhone Safari). Press Esc or the button again to exit. Opening a photo from the map leaves full screen to show the lightbox.
+
+### Changed
+- **Single-screen mobile layout**: The page no longer scrolls on phones. The route panel sits under the map at the height its content needs, and the map fills the rest of the screen. Only a panel taller than about half the screen (route editing) scrolls inside itself. Pull-to-refresh and overscroll bounce are disabled to prevent accidental scrolling.
+- **Sign-in and sign-out pages**: A failed sign-in shows an error page with **Try again** instead of redirecting back to the app, which would loop through Authentik. **Sign out** now leads to a signed-out page.
+- The in-app welcome screen with the **Sign in with Authentik** button is replaced by an automatic redirect.
+- Immich photo errors and the "choose a shorter range" hint now appear in the Immich photos panel.
+
+### Removed
+- **Recent points card on the home screen**: The last 10 uploads remain available on the Profile page.
+- **Map layers panel and legend in the sidebar**: The base map is still chosen with the switcher on the map. The route, gap and photo visibility toggles are gone, so all three are always shown.
+- **Expand panel button on mobile**: No longer needed now that the panel sits fully under the map.
+
 ## [0.0.4] - 2026-11-21
 
 ### Changed

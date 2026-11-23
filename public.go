@@ -21,7 +21,8 @@ func serveWeb(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if strings.HasPrefix(r.URL.Path, "/assets/") {
-		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		// private: assets sit behind sign-in, so shared proxies must not cache them.
+		w.Header().Set("Cache-Control", "private, max-age=31536000, immutable")
 	} else {
 		w.Header().Set("Cache-Control", "no-cache")
 	}

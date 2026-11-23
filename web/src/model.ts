@@ -202,6 +202,15 @@ export function onSessionUpdate(listener: (data: RefreshResult) => void) {
   sessionListener = listener;
 }
 
+let redirecting = false;
+
+/** Sends the browser to Authentik and returns here after sign-in. */
+export function redirectToSignIn() {
+  if (redirecting) return;
+  redirecting = true;
+  location.assign('/auth/login?next=' + encodeURIComponent(location.pathname + location.search));
+}
+
 export async function refreshSession(): Promise<RefreshResult> {
   if (refreshInFlight) return refreshInFlight;
   refreshInFlight = (async () => {

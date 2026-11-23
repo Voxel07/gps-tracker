@@ -19,6 +19,8 @@
     device: 'M7 2h10v20H7zM11 18h2',
     pin: 'M19 10c0 5-7 11-7 11S5 15 5 10a7 7 0 1 1 14 0Zm-5 0a2 2 0 1 1-4 0 2 2 0 0 1 4 0Z',
     check: 'm5 12 4 4L19 6',
+    expand: 'M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5',
+    shrink: 'M9 4v5H4M20 9h-5V4M15 20v-5h5M4 15h5v5',
   };
   let { name, size = 17 }: { name: keyof typeof paths; size?: number } = $props();
 </script>

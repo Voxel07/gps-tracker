@@ -291,7 +291,7 @@ func TestOIDCSignIn(t *testing.T) {
 	a.oidc = provider.VerifierContext(ctx, &oidc.Config{ClientID: "tracker"})
 	a.oauth = oauth2.Config{ClientID: "tracker", ClientSecret: "fixture", Endpoint: provider.Endpoint(), RedirectURL: a.origin + "/auth/callback"}
 	handler := a.routes()
-	login := request(t, handler, "GET", "/auth/login", "", "", nil, 302)
+	login := request(t, handler, "GET", "/auth/login?next="+url.QueryEscape("/?view=month"), "", "", nil, 302)
 	target, err := url.Parse(login.Header().Get("Location"))
 	if err != nil {
 		t.Fatal(err)
@@ -307,8 +307,8 @@ func TestOIDCSignIn(t *testing.T) {
 	}
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, callback)
-	if response.Code != 303 || response.Header().Get("Location") != "/" {
-		t.Fatal("OIDC callback did not finish sign-in")
+	if response.Code != 303 || response.Header().Get("Location") != "/?view=month" {
+		t.Fatalf("OIDC callback did not finish sign-in: %d %s", response.Code, response.Header().Get("Location"))
 	}
 	var session, refresh string
 	for _, cookie := range response.Result().Cookies() {
@@ -532,7 +532,22 @@ func TestSessionAndRefreshTokens(t *testing.T) {
 	// New session works on protected route
 	request(t, handler, "GET", "/api/keys", session2, "", nil, 200)
 
-	// Reusing old refresh1 revokes the entire token family
+	// A concurrent reuse right after rotation (e.g. two tabs) is rejected
+	// without revoking the family.
+	graceReq := httptest.NewRequest("POST", "/auth/refresh", nil)
+	graceReq.Header.Set("Origin", "https://tracker.example")
+	graceReq.AddCookie(&http.Cookie{Name: "__Host-gps_refresh", Value: refresh1})
+	graceRec := httptest.NewRecorder()
+	handler.ServeHTTP(graceRec, graceReq)
+	if graceRec.Code != 401 || len(graceRec.Result().Cookies()) != 0 {
+		t.Fatalf("reuse within grace returned %d with cookies %v, want 401 without cookies", graceRec.Code, graceRec.Result().Cookies())
+	}
+	request(t, handler, "GET", "/api/keys", session2, "", nil, 200)
+
+	// Reusing old refresh1 later revokes the entire token family
+	if _, err := a.db.Exec("UPDATE refresh_tokens SET revoked = ? WHERE hash = ?", time.Now().Add(-time.Minute).Unix(), tokenHash(refresh1)); err != nil {
+		t.Fatal(err)
+	}
 	reuseReq := httptest.NewRequest("POST", "/auth/refresh", nil)
 	reuseReq.Header.Set("Origin", "https://tracker.example")
 	reuseReq.AddCookie(&http.Cookie{Name: "__Host-gps_refresh", Value: refresh1})
@@ -659,5 +674,93 @@ func TestExportGPX(t *testing.T) {
 	}
 	if len(points) != 3 || invalid != 0 || !points[2].BreakBefore {
 		t.Fatalf("exported GPX mismatch: len=%d invalid=%d breakBefore=%v", len(points), invalid, len(points) == 3 && points[2].BreakBefore)
+	}
+}
+
+func TestWebAppRequiresSignIn(t *testing.T) {
+	a, alice, _ := testApp(t)
+	page := func(path, mode string, cookies ...*http.Cookie) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest("GET", path, nil)
+		if mode != "" {
+			req.Header.Set("Sec-Fetch-Mode", mode)
+		}
+		for _, cookie := range cookies {
+			req.AddCookie(cookie)
+		}
+		rec := httptest.NewRecorder()
+		a.routes().ServeHTTP(rec, req)
+		return rec
+	}
+
+	// Without Authentik configured the app stays locked.
+	if rec := page("/", "navigate"); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("unconfigured sign-in served the app with %d", rec.Code)
+	}
+
+	a.oidc = oidc.NewVerifier("https://auth.example", &oidc.StaticKeySet{}, &oidc.Config{ClientID: "tracker"})
+	a.oauth = oauth2.Config{ClientID: "tracker", Endpoint: oauth2.Endpoint{AuthURL: "https://auth.example/authorize"}, RedirectURL: a.origin + "/auth/callback"}
+
+	rec := page("/?view=month", "navigate")
+	if rec.Code != http.StatusFound || rec.Header().Get("Location") != "/auth/login?next="+url.QueryEscape("/?view=month") {
+		t.Fatalf("signed-out navigation returned %d to %q", rec.Code, rec.Header().Get("Location"))
+	}
+	if rec := page("/assets/index.js", "no-cors"); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("signed-out asset request returned %d, want 401", rec.Code)
+	}
+	if rec := page("/sw.js", "same-origin"); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("signed-out service worker request returned %d, want 401", rec.Code)
+	}
+	for _, path := range []string{"/manifest.webmanifest", "/icons/icon-192.png"} {
+		if rec := page(path, "cors"); rec.Code == http.StatusUnauthorized || rec.Code == http.StatusFound {
+			t.Fatalf("install file %s returned %d, want it to stay public", path, rec.Code)
+		}
+	}
+	if rec := page("/", "navigate", &http.Cookie{Name: "__Host-gps_session", Value: alice}); rec.Code == http.StatusFound || rec.Code == http.StatusUnauthorized {
+		t.Fatalf("signed-in navigation returned %d", rec.Code)
+	}
+
+	// An expired session with a valid refresh token is renewed on navigation.
+	issued := httptest.NewRecorder()
+	if _, err := a.issueTokens(context.Background(), issued, 1, nil); err != nil {
+		t.Fatal(err)
+	}
+	var refresh string
+	for _, cookie := range issued.Result().Cookies() {
+		if cookie.Name == "__Host-gps_refresh" {
+			refresh = cookie.Value
+		}
+	}
+	rec = page("/", "navigate", &http.Cookie{Name: "__Host-gps_refresh", Value: refresh})
+	var renewed string
+	for _, cookie := range rec.Result().Cookies() {
+		if cookie.Name == "__Host-gps_session" && cookie.MaxAge > 0 {
+			renewed = cookie.Value
+		}
+	}
+	if rec.Code == http.StatusFound || renewed == "" {
+		t.Fatalf("navigation with refresh token returned %d without a new session", rec.Code)
+	}
+	request(t, a.routes(), "GET", "/api/keys", renewed, "", nil, 200)
+	// Asset requests never rotate tokens, so parallel loads cannot trip reuse detection.
+	if rec := page("/assets/index.js", "no-cors", &http.Cookie{Name: "__Host-gps_refresh", Value: refresh}); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("asset request with only a refresh token returned %d", rec.Code)
+	}
+
+	// Failed callbacks and sign-out show a public page instead of looping back to Authentik.
+	if rec := page("/auth/callback?code=x&state=y", "navigate"); rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "Sign-in failed") {
+		t.Fatalf("failed callback returned %d", rec.Code)
+	}
+	if rec := page("/auth/signed-out", "navigate"); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `href="/auth/login"`) {
+		t.Fatalf("signed-out page returned %d", rec.Code)
+	}
+
+	for input, want := range map[string]string{
+		"/?view=month": "/?view=month", "": "/", "//evil.example": "/", `/\evil.example`: "/",
+		"https://evil.example": "/", "/auth/login": "/", "/x\r\nSet-Cookie: a=b": "/",
+	} {
+		if got := safeNext(input); got != want {
+			t.Errorf("safeNext(%q) = %q, want %q", input, got, want)
+		}
 	}
 }
