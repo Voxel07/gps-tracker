@@ -5,6 +5,14 @@ All notable changes to GPS Tracker are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.6] - 2026-11-23
+
+### Fixed
+- **No layout jump when switching periods on mobile**: The route summary keeps the same height while a day, month or year loads or has no points, so the map no longer resizes when you step between periods.
+
+### Removed
+- **Immich photos panel on mobile**: Photos are shown only as markers on the map on phones, which leaves more room for the map. Tapping a marker still opens the photo preview. The panel remains in the desktop sidebar.
+
 ## [0.0.5] - 2026-11-23
 
 ### Security

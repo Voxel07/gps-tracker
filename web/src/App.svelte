@@ -805,21 +805,24 @@
               <h2><Icon name="route" />Route summary</h2>
               <button type="button" disabled={loading || route.count === 0} onclick={beginEdit}><Icon name="edit" size={14} />Edit route</button>
             </div>
-            {#if loading}
-              <p class="muted" role="status">Loading route…</p>
-            {:else if route.count === 0}
-              <p class="muted">No points recorded in this period.</p>
-            {:else}
-              <div class="stats">
+            <!-- Stats and status message share one grid cell so the panel keeps
+                 the same height while switching periods (no layout jump on mobile). -->
+            <div class="summary-body">
+              <div class="stats" class:placeholder={loading || route.count === 0} aria-hidden={loading || route.count === 0}>
                 <div><strong>{route.count.toLocaleString()}</strong><small>Points</small></div>
                 <div><strong>{formatDistance(route.distance)}</strong><small>Distance</small></div>
                 <div><strong>{route.latest ? new Date(route.latest.time).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' }) : '–'}</strong><small>Latest</small></div>
               </div>
-            {/if}
+              {#if loading}
+                <p class="muted summary-status" role="status">Loading route…</p>
+              {:else if route.count === 0}
+                <p class="muted summary-status">No points recorded in this period.</p>
+              {/if}
+            </div>
           </section>
 
           {#if immich?.connected && (photos.length > 0 || photoError)}
-            <section class="panel">
+            <section class="panel photo-panel">
               <div class="section-heading">
                 <h2><Icon name="photo" />Immich photos ({photos.length})</h2>
                 <small class="muted">Tap for preview</small>

@@ -270,6 +270,10 @@ button:active:not(:disabled), .sign-in:active { translate: 0 1px; }
 .section-heading button { min-height: 36px; }
 
 .stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border-top: 1px solid var(--border); padding-top: 0.85rem; }
+.summary-body { display: grid; }
+.summary-body > * { grid-area: 1 / 1; }
+.stats.placeholder { visibility: hidden; }
+.summary-status { align-self: center; margin: 0; padding-top: 0.85rem; }
 .stats > div, .setting-row > div:first-child { display: flex; flex-direction: column; gap: 0.2rem; }
 .stats strong { font: 550 clamp(0.93rem, 1.5vw, 1.1rem)/1.35 var(--mono); letter-spacing: -0.035em; }
 .stats small { font-size: 0.74rem; }
@@ -901,6 +905,9 @@ input::file-selector-button {
     padding: 0.9rem 0.9rem max(1.1rem, env(safe-area-inset-bottom));
   }
   .map-area { order: 1; }
+  /* Photos are already shown as markers on the map; a second list would only
+     steal map height and resize it whenever a period has or lacks photos. */
+  .photo-panel { display: none; }
   .range-tabs { margin-top: 0.7rem; }
   .date-nav { margin-top: 0.5rem; }
   .panel { margin-top: 0.7rem; padding: 0.85rem; }
